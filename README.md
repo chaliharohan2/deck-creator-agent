@@ -124,6 +124,7 @@ The agent was run against real local models on a 4-vCPU, CPU-only machine (Ollam
 |---|---|
 | `qwen3.5:4b`, web research on | 8 slides with chart, table, two-column and quote in 9.5 min. The first searches found real data (EHPA: 2.9 M heat pumps sold in 2025, +13%). The search engines then throttled the machine's shared IP. With research cut off, the model **invented figures and source URLs**, which is what led to the fact and citation checks above. |
 | `qwen3.5:9b`, `--request-file examples/heat_pumps_notes.md --no-web` | 10 slides in 15 min, 0 tool errors; every figure in the text slides matched the notes. The chart mixed two real and two **invented** values while citing the real source, which led to the number cross-check. It also added a duplicate slide, so duplicates are now refused. |
+| same, with all guard rails | 11 slides in 13 min. The model charted an invented value (Germany = 1,700); the chart was **rejected**, and the model re-added it with only the real figures. It deleted an unsourced attributed quote after the warning. All figures and sources were correct. One wrong name slipped through ("Norfolk" for Norway, with the right number). Number checks can't catch that, so **review a deck before presenting it**. Afterwards the prompt was tightened on slide count and the `author` field. |
 
 These runs are why the guard rails exist. They are covered by unit tests with a scripted fake model (`tests/test_agent.py`, `tests/test_tools.py`, `tests/test_factcheck.py`).
 

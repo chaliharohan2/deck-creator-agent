@@ -136,7 +136,7 @@ _SOURCES = Field(default_factory=list, description="URLs or citations for facts 
 class DeckInfoArgs(ToolArgs):
     title: str = Field(description="Presentation title")
     subtitle: str = Field("", description="One-line subtitle")
-    author: str = Field("", description="Presenter or organisation name")
+    author: str = Field("", description="Presenter name, only if the user gave one")
     theme: ThemeName | None = Field(None, description="Visual theme")
 
 
