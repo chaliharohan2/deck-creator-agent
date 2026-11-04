@@ -48,6 +48,7 @@ class DeckSession:
     dirty: bool = False
     saved: dict[str, Path] = field(default_factory=dict)
     basename: str | None = None
+    known_urls: set[str] = field(default_factory=set)  # URLs the agent actually saw (search, pages, user)
 
     def __post_init__(self) -> None:
         if self.default_theme:
@@ -62,6 +63,20 @@ class DeckSession:
         self.dirty = False
         self.saved = {}
         self.basename = None
+
+    def note_urls(self, text: str) -> None:
+        """Remember URLs that genuinely appeared (search results, pages read, the user's message)."""
+        for url in _URL.findall(text or ""):
+            self.known_urls.add(_norm_url(url.rstrip(".,;:!?")))
+
+    def is_known_url(self, url: str) -> bool:
+        cited = _norm_url(url)
+        for known in self.known_urls:
+            if cited == known or known.startswith(cited + "/"):  # exact page, or a parent page of it
+                return True
+            if "/" not in known and cited.split("/", 1)[0] == known:  # user vouched for a whole site
+                return True
+        return False
 
     def insert(self, slide: Any, position: int | None) -> int:
         slides = self.deck.slides
@@ -86,7 +101,8 @@ class DeckSession:
             self.basename = safe_filename(filename)
         if not self.basename:
             self.basename = safe_filename(self.deck.title, default="deck")
-        fmts = formats or self.formats
+        # The user's configured formats are a floor; the model may add formats but not drop them.
+        fmts = list(dict.fromkeys([*self.formats, *(formats or [])]))
         note = ""
         try:
             paths = render_deck(self.deck, self.output_dir, self.basename, fmts)
@@ -239,6 +255,15 @@ def _bullet_warnings(bullets: list[str]) -> str:
     return (" Tip: " + "; ".join(notes) + ".") if notes else ""
 
 
+_URL = re.compile(r"https?://[^\s<>\"'()\[\]{}]+")
+
+
+def _norm_url(url: str) -> str:
+    url = re.sub(r"^https?://", "", url.strip().lower()).split("#", 1)[0]
+    url = url.removeprefix("www.")
+    return url.rstrip("/")
+
+
 _FIGURE = re.compile(
     r"\d[\d,.]*\s?(%|percent|per ?cent|million|billion|trillion|bn\b|mn\b|[kmb]\b)|[$€£¥₹]\s?\d|\d\s?(gw|mw|kwh|twh|t\b|tonnes?)",
     re.IGNORECASE,
@@ -252,6 +277,21 @@ def _unsourced_figures_warning(texts: list[str], sources: list[str]) -> str:
     return (" Warning: this slide states specific figures but has no `sources`. If the numbers did not come "
             "from the user or from a page you read, rewrite the slide without precise figures (update_slide); "
             "otherwise add the source URL.")
+
+
+def _vet_sources(session: DeckSession, slide: Any, texts: list[str]) -> str:
+    """Drop cited URLs the agent never saw, then flag figures that are left without a source.
+
+    Small models invent plausible-looking citations; a fabricated source is worse than none.
+    """
+    invented = [s for s in slide.sources if _URL.match(s) and not session.is_known_url(s)]
+    note = ""
+    if invented:
+        slide.sources = [s for s in slide.sources if s not in invented]
+        note = (f" Removed source(s) {', '.join(invented[:3])}: they did not appear in your search results, the pages "
+                "you read or the user's message. Only cite pages you actually used, and remove figures you cannot "
+                "source (update_slide).")
+    return note + _unsourced_figures_warning(texts, slide.sources)
 
 
 def _added(session: DeckSession, index: int, slide: Any, extra: str = "") -> str:
@@ -295,7 +335,7 @@ def register_deck_tools(registry: ToolRegistry, session: DeckSession) -> None:
     def add_bullet_slide(a: BulletArgs) -> str:
         _ensure_title_slide(session)
         slide = BulletSlide(title=a.title, bullets=a.bullets, notes=a.notes, sources=a.sources)
-        extra = _bullet_warnings(slide.bullets) + _unsourced_figures_warning([slide.title, *slide.bullets], slide.sources)
+        extra = _bullet_warnings(slide.bullets) + _vet_sources(session, slide, [slide.title, *slide.bullets])
         return _added(session, session.insert(slide, a.position), slide, extra)
 
     @registry.add("add_two_column_slide", "Add a slide comparing two things side by side (pros/cons, before/after, A vs B).",
@@ -305,7 +345,7 @@ def register_deck_tools(registry: ToolRegistry, session: DeckSession) -> None:
         slide = TwoColumnSlide(title=a.title, left_heading=a.left_heading, left_bullets=a.left_bullets,
                                right_heading=a.right_heading, right_bullets=a.right_bullets,
                                notes=a.notes, sources=a.sources)
-        extra = _unsourced_figures_warning([slide.title, *slide.left_bullets, *slide.right_bullets], slide.sources)
+        extra = _vet_sources(session, slide, [slide.title, *slide.left_bullets, *slide.right_bullets])
         return _added(session, session.insert(slide, a.position), slide, extra)
 
     @registry.add("add_chart_slide",
@@ -318,9 +358,10 @@ def register_deck_tools(registry: ToolRegistry, session: DeckSession) -> None:
             y_axis_title=a.y_axis_title, x_axis_title=a.x_axis_title, bullets=a.takeaways,
             notes=a.notes, sources=a.sources,
         )
-        extra = "" if a.sources else (
-            " Warning: this chart has no `sources`. Charts must use real numbers from the user or from pages you "
-            "read; add the source URL, or delete the slide if the numbers were estimated.")
+        extra = _vet_sources(session, slide, [])
+        if not slide.sources:
+            extra += (" Warning: this chart has no `sources`. Charts must use real numbers from the user or from "
+                      "pages you read; add the source URL, or delete the slide if the numbers were estimated.")
         return _added(session, session.insert(slide, a.position), slide, extra)
 
     @registry.add("add_table_slide", "Add a slide with a table (structured comparisons, specs, timelines).", TableArgs)
@@ -328,7 +369,7 @@ def register_deck_tools(registry: ToolRegistry, session: DeckSession) -> None:
         _ensure_title_slide(session)
         slide = TableSlide(title=a.title, headers=a.headers, rows=a.rows, notes=a.notes, sources=a.sources)
         cells = [slide.title, *slide.headers, *(c for row in slide.rows for c in row)]
-        return _added(session, session.insert(slide, a.position), slide, _unsourced_figures_warning(cells, slide.sources))
+        return _added(session, session.insert(slide, a.position), slide, _vet_sources(session, slide, cells))
 
     @registry.add("add_image_slide",
                   "Add a slide with an image (URL from search_images, or a local file) and optional bullets.", ImageArgs)
@@ -339,7 +380,8 @@ def register_deck_tools(registry: ToolRegistry, session: DeckSession) -> None:
         path = save_image(a.image, session.assets_dir, allow_private=session.allow_private_urls)
         slide = ImageSlide(title=a.title, image_path=str(path), caption=a.caption, credit=a.credit,
                            bullets=a.bullets, notes=a.notes, sources=a.sources)
-        return _added(session, session.insert(slide, a.position), slide)
+        extra = _vet_sources(session, slide, [slide.title, *slide.bullets])
+        return _added(session, session.insert(slide, a.position), slide, extra)
 
     @registry.add("add_section_slide", "Add a section divider slide to separate parts of the talk.", SectionArgs)
     def add_section_slide(a: SectionArgs) -> str:
@@ -351,7 +393,7 @@ def register_deck_tools(registry: ToolRegistry, session: DeckSession) -> None:
     def add_quote_slide(a: QuoteArgs) -> str:
         _ensure_title_slide(session)
         slide = QuoteSlide(quote=a.quote, attribution=a.attribution, notes=a.notes, sources=a.sources)
-        extra = ""
+        extra = _vet_sources(session, slide, [slide.quote])
         if slide.attribution and not slide.sources:
             extra = (" Warning: a quotation attributed to someone needs the URL of the page where you read it in "
                      "`sources`. If you wrote this statement yourself, remove the attribution (update_slide cannot "
@@ -378,11 +420,13 @@ def register_deck_tools(registry: ToolRegistry, session: DeckSession) -> None:
             raise ToolError(f"slide {a.slide_number} ({slide.kind}) has no field(s) {unknown}")
         data.update(changes)
         new_slide = SLIDE_TYPES[slide.kind].model_validate(data)
+        texts = [getattr(new_slide, "title", ""), *getattr(new_slide, "bullets", [])]
+        extra = _vet_sources(session, new_slide, texts)
         session.deck.slides[a.slide_number - 1] = new_slide
         if isinstance(new_slide, TitleSlide) and a.slide_number == 1:
             session.deck.title, session.deck.subtitle = new_slide.title, new_slide.subtitle
         session.dirty = True
-        return f"Updated slide {a.slide_number} ({', '.join(changes)})."
+        return f"Updated slide {a.slide_number} ({', '.join(changes)}).{extra}"
 
     @registry.add("delete_slide", "Delete a slide by its number.", SlideNumberArgs)
     def delete_slide(a: SlideNumberArgs) -> str:

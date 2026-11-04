@@ -42,7 +42,7 @@ class ImageSearchArgs(ToolArgs):
 
 def register_web_tools(registry: ToolRegistry, backend: SearchBackend, *, max_page_chars: int = 6000,
                        allow_private: bool = False, images: bool = True, max_searches: int = 4,
-                       max_reads: int = 4) -> None:
+                       max_reads: int = 4, session: DeckSession | None = None) -> None:
     """Register web tools. Searches/reads are budgeted per request: small models tend to
     keep researching instead of building, so after the budget the tool tells them to move on."""
     used = {"web_search": 0, "read_webpage": 0, "empty_in_a_row": 0}
@@ -69,18 +69,26 @@ def register_web_tools(registry: ToolRegistry, backend: SearchBackend, *, max_pa
         spend("web_search", max_searches)
         rows = backend.text(a.query, a.max_results)
         used["empty_in_a_row"] = 0 if rows else used["empty_in_a_row"] + 1
+        if session is not None:
+            session.note_urls(" ".join(r.get("url", "") for r in rows))
         return format_search_results(rows)
 
     @registry.add("read_webpage", "Read the main text of a web page or PDF to get facts and numbers.", ReadArgs)
     def read_webpage(a: ReadArgs) -> str:
         spend("read_webpage", max_reads)
-        return fetch_page(a.url, max_chars=max_page_chars, allow_private=allow_private)
+        text = fetch_page(a.url, max_chars=max_page_chars, allow_private=allow_private)
+        if session is not None:
+            session.note_urls(a.url + " " + text[:600])  # requested URL and the final URL after redirects
+        return text
 
     if images:
         @registry.add("search_images",
                       "Find freely licensed (Creative Commons) images for a slide. Use sparingly.", ImageSearchArgs)
         def search_images(a: ImageSearchArgs) -> str:
-            return format_image_results(backend.images(a.query, a.max_results))
+            rows = backend.images(a.query, a.max_results)
+            if session is not None:
+                session.note_urls(" ".join(f"{r.get('page_url', '')} {r.get('image_url', '')}" for r in rows))
+            return format_image_results(rows)
 
 
 def build_registry(settings: Settings, session: DeckSession, backend: SearchBackend | None = None) -> ToolRegistry:
@@ -92,6 +100,6 @@ def build_registry(settings: Settings, session: DeckSession, backend: SearchBack
         )
         register_web_tools(registry, backend, max_page_chars=settings.max_page_chars,
                            allow_private=settings.allow_private_urls, max_searches=settings.max_searches,
-                           max_reads=settings.max_reads)
+                           max_reads=settings.max_reads, session=session)
     register_deck_tools(registry, session)
     return registry

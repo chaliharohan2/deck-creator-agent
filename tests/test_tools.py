@@ -5,6 +5,7 @@ import pytest
 from pptx import Presentation
 
 from deck_agent.config import Settings
+from deck_agent.deck.model import BulletSlide
 from deck_agent.tools import DeckSession, ToolError, build_registry
 from deck_agent.tools.web import (
     FallbackBackend,
@@ -255,8 +256,10 @@ def test_unsourced_figures_are_flagged(setup):
     registry, _, _ = setup
     r = registry.execute("add_bullet_slide", {"title": "Growth", "bullets": ["Sales grew 35% in 2024", "1.8 million units"]})
     assert r.ok and "no `sources`" in r.content
-    r = registry.execute("add_bullet_slide", {"title": "Growth", "bullets": ["Sales grew 35%"], "sources": ["https://ehpa.org"]})
-    assert "Warning" not in r.content
+    registry.execute("web_search", {"query": "x"})  # makes https://example.com/0 a URL the agent has seen
+    r = registry.execute("add_bullet_slide", {"title": "Growth", "bullets": ["Sales grew 35%"],
+                                              "sources": ["https://example.com/0"]})
+    assert "Warning" not in r.content and "Removed" not in r.content
     r = registry.execute("add_bullet_slide", {"title": "Why", "bullets": ["Cleaner air", "Founded in 2024"]})
     assert "Warning" not in r.content  # a year alone is not a statistic
     r = registry.execute("add_chart_slide", {"title": "c", "categories": ["a"], "series": [[1]]})
@@ -269,6 +272,43 @@ def test_attributed_quote_without_source_is_flagged(setup):
     registry, _, _ = setup
     r = registry.execute("add_quote_slide", {"quote": "Heat is the sleeping giant", "attribution": "EU Commission"})
     assert r.ok and "needs the URL" in r.content
-    r = registry.execute("add_quote_slide", {"quote": "Act now", "attribution": "X", "sources": ["https://x.org"]})
+    registry.execute("web_search", {"query": "x"})
+    r = registry.execute("add_quote_slide", {"quote": "Act now", "attribution": "X", "sources": ["https://example.com/1"]})
     assert "Warning" not in r.content
     assert "Warning" not in registry.execute("add_quote_slide", {"quote": "Our own key message"}).content
+
+
+def test_invented_source_urls_are_removed(setup):
+    registry, session, _ = setup
+    registry.execute("web_search", {"query": "heat pumps"})  # sees https://example.com/0..4
+    session.note_urls("Use https://www.ehpa.org/market-data/ please")  # e.g. from the user's message
+    r = registry.execute("add_bullet_slide", {
+        "title": "Sales", "bullets": ["Sales rose 13%"],
+        "sources": ["https://example.com/2", "http://ehpa.org/market-data", "https://iea.org/fake-report", "EHPA 2025"]})
+    slide = session.deck.slides[-1]
+    assert slide.sources == ["https://example.com/2", "http://ehpa.org/market-data", "EHPA 2025"]
+    assert "Removed source(s) https://iea.org/fake-report" in r.content
+    # all URL sources invented -> removed, and the figure is then flagged as unsourced
+    r = registry.execute("add_chart_slide", {"title": "c", "categories": ["a"], "series": [[1]],
+                                             "sources": ["https://made.up/stats"]})
+    assert "Removed" in r.content and "no `sources`" in r.content
+    assert session.deck.slides[-1].sources == []
+    r = registry.execute("update_slide", {"slide_number": 1, "sources": ["https://made.up/x"]})
+    assert "Removed" in r.content and session.deck.slides[0].sources == []
+
+
+def test_known_url_matching():
+    s = DeckSession()
+    s.note_urls("see https://www.Example.org/reports/2025/heat?x=1#top, and https://ehpa.org.")
+    assert s.is_known_url("https://example.org/reports/2025/heat?x=1")
+    assert s.is_known_url("http://example.org/reports/2025")  # parent page of a seen page
+    assert not s.is_known_url("https://example.org/reports/2025/other")
+    assert s.is_known_url("https://ehpa.org/market-data")  # user gave the whole site
+    assert not s.is_known_url("https://notehpa.org")
+
+
+def test_user_formats_are_a_floor(tmp_path):
+    session = DeckSession(output_dir=tmp_path, formats=["pptx", "html"])
+    session.deck.slides.append(BulletSlide(title="t", bullets=["b"]))
+    paths, _ = session.save(formats=["pptx"])
+    assert {"pptx", "html"} <= set(paths)

@@ -49,6 +49,8 @@ All Apache-2.0. Benchmarks, sources, alternatives (Gemma 4 26B-A4B, Granite 4.2)
 # One request → one deck (autonomous)
 deck-agent run "8 slides comparing solar and wind for a high-school class" --theme warm
 deck-agent run "Investor update for Q3" --request-file notes.md --no-web    # use your own material, offline
+deck-agent run "8-slide briefing for a city council, with a chart" \
+    --request-file examples/heat_pumps_notes.md --no-web                   # try it with the bundled example
 deck-agent run "..." -m qwen3.6:35b --think        # bigger model + reasoning mode (best on a GPU)
 
 # Conversation: build, then refine
@@ -64,6 +66,8 @@ deck-agent render decks/Heat_Pumps.deck.json -f pptx pdf --theme dark
 deck-agent themes      # light, dark, corporate, warm, forest, minimal
 deck-agent doctor      # checks model server, tool calling, web search, LibreOffice
 ```
+
+The formats you pass with `-f` are always produced (the model can add formats, not remove them).
 
 Common options: `-m/--model`, `-f/--formats pptx pdf html`, `-t/--theme`, `-o/--out-dir`, `--slides N`, `--no-web`, `--think`, `--num-ctx`, `-v/--verbose` (shows every tool result). Run `deck-agent run -h` for all options.
 
@@ -102,7 +106,8 @@ Every slide can carry **speaker notes** and **sources**. Sources appear in a foo
 
 * **Simple, flat tool schemas.** One tool per slide type with flat parameters instead of one deeply nested "deck" object.
 * **Forgiving inputs, strict outputs.** Bullets sent as one string, `"45%"` instead of `45`, `2024` instead of `"2024"`, and `{"Revenue": [...]}` instead of a series list are all accepted. Mismatched chart data or oversized tables come back as precise, fixable errors.
-* **Guard rails.** Repeated identical calls are short-circuited, research is capped per request (`DECK_AGENT_MAX_SEARCHES`, default 4), empty searches tell the model to build with what it has, and a model that only *describes* a plan is nudged to call tools.
+* **Guard rails.** Repeated identical calls are short-circuited, research is capped per request (`DECK_AGENT_MAX_SEARCHES`, default 4), and exhausted tools are removed from the tool list (small models ignore "stop searching" but not a missing tool). A model that only *describes* a plan is nudged to call tools.
+* **Citation checks.** Small models invent statistics *and* plausible-looking source URLs. A cited URL is kept only if the agent actually saw it, in search results, a page it read, or your own input. Invented URLs are removed, and the model is told about them. Slides with specific figures, charts or attributed quotes but no surviving source get a warning back to the model.
 * **Never lose work.** Old tool output is trimmed near the context limit, and an unsaved deck is always saved at the end.
 * **Thinking off by default.** Reasoning mode multiplies CPU time. Turn it on with `--think` on a GPU.
 

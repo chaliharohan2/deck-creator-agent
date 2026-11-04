@@ -149,6 +149,7 @@ class DeckAgent:
     # ------------------------------------------------------------------ main loop
     def run(self, user_message: str) -> AgentResult:
         self.registry.new_request()
+        self.session.note_urls(user_message)  # URLs the user supplied are legitimate sources
         self.messages.append({"role": "user", "content": user_message})
         result = AgentResult(text="")
         nudges = 0

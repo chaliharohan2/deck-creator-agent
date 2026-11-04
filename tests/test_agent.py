@@ -155,3 +155,12 @@ def test_offline_prompt(tmp_path):
     agent, _ = make_agent(tmp_path, [], web=False)
     assert "Web research is disabled" in agent.messages[0]["content"]
     assert "web_search" not in agent.registry
+
+
+def test_urls_in_user_message_count_as_sources(tmp_path):
+    script = [[("set_deck_info", {"title": "T"})],
+              [("add_bullet_slide", {"title": "a", "bullets": ["Sales rose 13%"], "sources": ["https://ehpa.org/market-data/"]})],
+              "done"]
+    agent, _ = make_agent(tmp_path, script, web=False)
+    agent.run("Use these notes. Source: https://ehpa.org/market-data/")
+    assert agent.session.deck.slides[1].sources == ["https://ehpa.org/market-data/"]
