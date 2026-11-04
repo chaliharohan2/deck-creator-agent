@@ -71,6 +71,13 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("chat", help="interactive session: build a deck and refine it over several turns")
     _add_agent_args(p)
 
+    p = sub.add_parser("ui", help="open the browser UI: chat, live deck preview and downloads")
+    _add_agent_args(p)
+    p.add_argument("--host", default="127.0.0.1", help="interface to bind (default 127.0.0.1: this computer only)")
+    p.add_argument("--port", type=int, default=7860)
+    p.add_argument("--open", action="store_true", help="open the UI in your web browser")
+    p.add_argument("--deck", type=Path, help="open a saved .deck.json to preview, edit or download it")
+
     p = sub.add_parser("render", help="re-render a saved .deck.json without the LLM")
     p.add_argument("spec", type=Path)
     p.add_argument("-o", "--out-dir", type=Path)
@@ -280,6 +287,13 @@ def cmd_chat(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ui(args: argparse.Namespace) -> int:
+    from deck_agent.web import serve
+
+    serve(settings_from_args(args), host=args.host, port=args.port, open_browser=args.open, deck_path=args.deck)
+    return 0
+
+
 def cmd_render(args: argparse.Namespace) -> int:
     deck = Deck.load_json(args.spec)
     if args.theme:
@@ -374,7 +388,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    handlers = {"run": cmd_run, "chat": cmd_chat, "render": cmd_render, "sample": cmd_sample,
+    handlers = {"run": cmd_run, "chat": cmd_chat, "ui": cmd_ui, "render": cmd_render, "sample": cmd_sample,
                 "themes": cmd_themes, "doctor": cmd_doctor}
     try:
         return handlers[args.command](args)

@@ -29,6 +29,29 @@ deck-agent run "Create a 10-slide deck on the adoption of heat pumps in Europe f
 
 Files are written to `./decks/`: `<title>.pptx`, `.pdf`, `.html` and an editable `<title>.deck.json`.
 
+Prefer a browser? Run `deck-agent ui --open` (see [Web UI](#web-ui)).
+
+## Web UI
+
+![Deck Agent web UI: chat with step-by-step progress on the left, live slide preview, slide strip and download buttons on the right](docs/ui.png)
+
+```bash
+deck-agent ui --open                    # http://127.0.0.1:7860
+deck-agent ui -m qwen3.6:35b --no-web   # same options as `run`
+deck-agent ui --deck decks/Heat_Pumps.deck.json   # open a saved deck to preview, edit or download
+```
+
+* **Chat** on the left. Describe the deck, attach notes, reports or PDFs as source material, then ask for changes ("make slide 4 a comparison", "add a chart of the sales figures"). While the model works, every step shows up live: searches, pages read, slides added and errors it corrected. **Stop** interrupts it.
+* **Preview** on the right. The deck redraws as each slide is added. Click a slide in the strip to jump to it.
+  * **Live preview** is instant and works without anything extra.
+  * **PowerPoint render** shows the actual `.pptx`, drawn by LibreOffice, as slide images. This is what your audience will see.
+  * The theme menu restyles the deck instantly, without re-running the model.
+* **Download** PPTX, PDF, HTML or the editable JSON spec when you're happy. Copies are also kept in the output folder.
+* The top bar switches the model, web research and fact-checking between messages. **New deck** starts over.
+* Reloading the page restores the conversation and deck.
+
+The UI is plain HTML/CSS/JS served by Starlette + uvicorn (BSD-3); it loads nothing from the internet. It listens on `127.0.0.1` only and has no login, so don't expose it with `--host 0.0.0.0` on a shared network. Cross-site requests and DNS-rebinding attempts are refused.
+
 Try the renderer without any model: `deck-agent sample -f pptx html pdf`.
 
 ## Which model should I use?
@@ -101,6 +124,8 @@ Every slide can carry **speaker notes** and **sources**. Sources appear in a foo
 | `src/deck_agent/toolcall_parse.py` | Recovers tool calls a server returned as text (Hermes JSON, Qwen XML) |
 | `src/deck_agent/tools/` | Tool registry, deck tools, web tools |
 | `src/deck_agent/deck/` | Deck schema, themes, PPTX / HTML / PDF renderers |
+| `src/deck_agent/factcheck.py` | Cross-checks slide numbers against the material the agent saw |
+| `src/deck_agent/web/` | Browser UI: Starlette server (SSE progress stream) + static HTML/CSS/JS |
 
 ### Why it works with small models
 

@@ -265,6 +265,9 @@ def _bullet_warnings(bullets: list[str]) -> str:
     top_level = [b for b in bullets if not b.startswith("- ")]
     if len(top_level) > 6:
         notes.append("more than 6 bullets; consider splitting the slide")
+    if len(top_level) == 1:
+        notes.append("the slide has a single bullet; add 2-4 supporting points with update_slide, "
+                     "or fold it into another slide")
     return (" Tip: " + "; ".join(notes) + ".") if notes else ""
 
 

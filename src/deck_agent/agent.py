@@ -14,6 +14,7 @@ guard rails:
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date
@@ -65,6 +66,10 @@ NUDGE = (
 EventFn = Callable[[str, dict[str, Any]], None]
 
 
+class AgentCancelled(Exception):
+    """Raised inside the loop (including mid-stream) when :meth:`DeckAgent.cancel` was called."""
+
+
 @dataclass
 class AgentResult:
     text: str
@@ -103,7 +108,23 @@ class DeckAgent:
         self.interactive = interactive
         self.on_event = on_event or (lambda kind, data: None)
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": self.system_prompt()}]
+        self._cancel = threading.Event()
         self._refresh_schemas()
+
+    def cancel(self) -> None:
+        """Ask a running :meth:`run` to stop as soon as possible (thread-safe)."""
+        self._cancel.set()
+
+    def set_registry(self, registry: ToolRegistry) -> None:
+        """Swap the tool set (e.g. web research toggled) while keeping the conversation."""
+        self.registry = registry
+        self.messages[0] = {"role": "system", "content": self.system_prompt()}
+        self._refresh_schemas()
+
+    def _progress(self, tokens: int, phase: str) -> None:
+        if self._cancel.is_set():
+            raise AgentCancelled
+        self.on_event("llm_progress", {"tokens": tokens, "phase": phase})
 
     def _refresh_schemas(self) -> None:
         # Re-read every step: tools can be switched off mid-request (e.g. exhausted web search).
@@ -148,6 +169,7 @@ class DeckAgent:
 
     # ------------------------------------------------------------------ main loop
     def run(self, user_message: str) -> AgentResult:
+        self._cancel.clear()
         self.registry.new_request()
         self.session.note_source(user_message)  # the user's URLs and numbers are legitimate sources
         self.messages.append({"role": "user", "content": user_message})
@@ -157,15 +179,19 @@ class DeckAgent:
         start_slides = len(self.session.deck.slides)
 
         for step in range(1, self.settings.max_steps + 1):
+            if self._cancel.is_set():
+                result.stopped_reason, result.text = "cancelled", "Stopped."
+                break
             result.steps = step
             self._refresh_schemas()
             self._trim_context()
             self.on_event("llm_start", {"step": step})
             try:
-                response: LLMResponse = self.llm.chat(
-                    self.messages, self._tool_schemas,
-                    on_progress=lambda n, phase: self.on_event("llm_progress", {"tokens": n, "phase": phase}),
-                )
+                response: LLMResponse = self.llm.chat(self.messages, self._tool_schemas, on_progress=self._progress)
+            except AgentCancelled:
+                self.on_event("llm_end", {"step": step, "prompt_tokens": 0, "completion_tokens": 0, "recovered": False})
+                result.stopped_reason, result.text = "cancelled", "Stopped."
+                break
             except LLMError as exc:
                 self.on_event("llm_error", {"error": str(exc)})
                 result.text = f"Model error: {exc}"
@@ -194,6 +220,10 @@ class DeckAgent:
                 "tool_calls": [{"id": c.id, "name": c.name, "arguments": c.arguments} for c in response.tool_calls],
             })
             for call in response.tool_calls:
+                if self._cancel.is_set():  # every tool call still needs a result message
+                    self.messages.append({"role": "tool", "tool_call_id": call.id, "name": call.name,
+                                          "content": "Cancelled by the user."})
+                    continue
                 result.tool_calls += 1
                 sig = _signature(call.name, call.arguments)
                 self.on_event("tool_call", {"name": call.name, "arguments": call.arguments})

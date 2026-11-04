@@ -19,6 +19,8 @@ All are OSI-approved licences; none requires an account, API key or payment.
 | Pillow | MIT-CMU | Image validation and conversion |
 | XlsxWriter | BSD-2 | Chart data embedded in .pptx (used by python-pptx) |
 | rich, markdown-it-py, mdurl, Pygments | MIT / BSD-2 | Terminal UI |
+| starlette, uvicorn | BSD-3 | Local web UI server (front end is hand-written HTML/CSS/JS, no external assets) |
+| pypdfium2 (PDFium) | BSD-3 / Apache-2.0 | Turns the LibreOffice PDF into slide images for the UI's "PowerPoint render" tab |
 | click, dateparser, python-dateutil, regex, pytz, tzlocal, tzdata, babel, charset-normalizer, idna, urllib3, certifi, tld, typing-extensions, annotated-types, typing-inspection | MIT / BSD / Apache-2.0 / PSF / MPL-2.0 | Transitive utilities |
 
 Notes on weak copyleft: `certifi` is MPL-2.0 and `tld` is tri-licensed MPL-1.1 / GPL-2.0 / LGPL-2.1. Both are file-level licences: you can use them unmodified in any project, including commercial or closed-source ones.

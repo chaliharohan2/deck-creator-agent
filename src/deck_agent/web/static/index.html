@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deck Agent</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='3' y='6' width='26' height='18' rx='3' fill='%232f5bea'/%3E%3Crect x='8' y='15' width='4' height='5' fill='white'/%3E%3Crect x='14' y='12' width='4' height='8' fill='white'/%3E%3Crect x='20' y='10' width='4' height='10' fill='white'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="6" width="26" height="18" rx="3"/><rect class="bar" x="8" y="15" width="4" height="5"/><rect class="bar" x="14" y="12" width="4" height="8"/><rect class="bar" x="20" y="10" width="4" height="10"/></svg>
+    <span>Deck Agent</span>
+  </div>
+  <div class="controls">
+    <label class="field" title="Local model served by Ollama or your OpenAI-compatible server">
+      <span>Model</span>
+      <select id="model" aria-label="Model"></select>
+    </label>
+    <label class="switch" title="Let the agent search the web and read pages">
+      <input type="checkbox" id="web"><span class="track"></span><span>Web research</span>
+    </label>
+    <label class="switch" title="Reject chart values and flag figures that appear in no source the agent saw">
+      <input type="checkbox" id="factcheck"><span class="track"></span><span>Fact-check numbers</span>
+    </label>
+    <button id="newDeck" class="btn ghost" type="button">New deck</button>
+  </div>
+</header>
+
+<main class="layout">
+  <section class="chat" aria-label="Chat">
+    <div id="messages" class="messages" aria-live="polite">
+      <div id="welcome" class="welcome">
+        <h1>What should the deck be about?</h1>
+        <p>Describe the topic, audience and length. Attach notes, a report or a PDF to have the agent build the deck from your own material.</p>
+        <div class="examples">
+          <button type="button" class="example">8 slides on heat pump adoption in Europe for a city council, with a chart</button>
+          <button type="button" class="example">A 6-slide phishing-awareness training for new employees</button>
+          <button type="button" class="example">Compare solar and wind power for a high-school class, 8 slides, warm theme</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="status" class="status" hidden>
+      <span class="spinner" aria-hidden="true"></span>
+      <span id="statusText">Working…</span>
+    </div>
+
+    <form id="composer" class="composer">
+      <div id="attachments" class="chips"></div>
+      <textarea id="input" rows="3" placeholder="Describe the deck you want, or ask for changes (e.g. “make slide 4 a two-column comparison”)…" aria-label="Message"></textarea>
+      <div class="composer-row">
+        <label class="btn ghost attach" title="Attach .txt, .md, .csv or .pdf files as source material">
+          <input type="file" id="file" multiple accept=".txt,.md,.markdown,.csv,.json,.pdf">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16.5 6.5l-7.8 7.8a2 2 0 102.8 2.8l7.8-7.8a4 4 0 10-5.7-5.7L5.8 11.4a6 6 0 108.5 8.5l6.4-6.4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+          <span>Attach</span>
+        </label>
+        <span class="hint">Enter to send · Shift+Enter for a new line</span>
+        <button type="submit" id="send" class="btn primary">Send</button>
+        <button type="button" id="stop" class="btn danger" hidden>Stop</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="preview" aria-label="Deck preview">
+    <div class="preview-bar">
+      <div class="deck-meta">
+        <h2 id="deckTitle">No deck yet</h2>
+        <span id="deckCount" class="muted"></span>
+      </div>
+      <div class="tabs" role="tablist">
+        <button type="button" class="tab active" role="tab" data-mode="html" aria-selected="true">Live preview</button>
+        <button type="button" class="tab" role="tab" data-mode="pdf" id="pdfTab" aria-selected="false">PowerPoint render</button>
+      </div>
+      <label class="field compact" title="Change the visual theme without re-running the model">
+        <select id="theme" aria-label="Theme"></select>
+      </label>
+      <div class="downloads" role="group" aria-label="Download">
+        <svg class="dl-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11m0 0l-4.5-4.5M12 15l4.5-4.5M5 19h14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <a class="btn" id="dl-pptx" data-fmt="pptx" href="/api/download/pptx">PPTX</a>
+        <a class="btn" id="dl-pdf" data-fmt="pdf" href="/api/download/pdf">PDF</a>
+        <a class="btn" id="dl-html" data-fmt="html" href="/api/download/html">HTML</a>
+        <a class="btn ghost" id="dl-json" data-fmt="json" href="/api/download/json" title="Editable deck spec; re-render with deck-agent render">JSON</a>
+      </div>
+    </div>
+    <div class="stage">
+      <iframe id="frame" title="Deck preview" src="/api/preview.html"></iframe>
+      <div id="pages" class="pages" hidden>
+        <button type="button" class="nav prev" id="pagePrev" aria-label="Previous slide">‹</button>
+        <img id="pageImg" alt="Slide rendered from the PowerPoint file">
+        <button type="button" class="nav next" id="pageNext" aria-label="Next slide">›</button>
+        <span id="pageNum" class="page-num"></span>
+      </div>
+      <div id="overlay" class="overlay" hidden><span class="spinner"></span><span id="overlayText">Rendering…</span></div>
+    </div>
+    <ol id="outline" class="outline" aria-label="Slides"></ol>
+  </section>
+</main>
+
+<div id="toast" class="toast" role="alert" hidden></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
