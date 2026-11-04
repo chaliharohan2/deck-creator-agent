@@ -249,3 +249,26 @@ def test_save_image_converts_and_validates(tmp_path, png):
         save_image(str(svg), tmp_path / "assets")
     with pytest.raises(ToolError):
         save_image("http://localhost/x.png", tmp_path / "assets")
+
+
+def test_unsourced_figures_are_flagged(setup):
+    registry, _, _ = setup
+    r = registry.execute("add_bullet_slide", {"title": "Growth", "bullets": ["Sales grew 35% in 2024", "1.8 million units"]})
+    assert r.ok and "no `sources`" in r.content
+    r = registry.execute("add_bullet_slide", {"title": "Growth", "bullets": ["Sales grew 35%"], "sources": ["https://ehpa.org"]})
+    assert "Warning" not in r.content
+    r = registry.execute("add_bullet_slide", {"title": "Why", "bullets": ["Cleaner air", "Founded in 2024"]})
+    assert "Warning" not in r.content  # a year alone is not a statistic
+    r = registry.execute("add_chart_slide", {"title": "c", "categories": ["a"], "series": [[1]]})
+    assert r.ok and "Charts must use real numbers" in r.content
+    r = registry.execute("add_table_slide", {"title": "Costs", "headers": ["Country", "Cost"], "rows": [["DE", "€30,000"]]})
+    assert "no `sources`" in r.content
+
+
+def test_attributed_quote_without_source_is_flagged(setup):
+    registry, _, _ = setup
+    r = registry.execute("add_quote_slide", {"quote": "Heat is the sleeping giant", "attribution": "EU Commission"})
+    assert r.ok and "needs the URL" in r.content
+    r = registry.execute("add_quote_slide", {"quote": "Act now", "attribution": "X", "sources": ["https://x.org"]})
+    assert "Warning" not in r.content
+    assert "Warning" not in registry.execute("add_quote_slide", {"quote": "Our own key message"}).content

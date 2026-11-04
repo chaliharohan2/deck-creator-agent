@@ -170,6 +170,3 @@ pytest            # 80+ tests; the agent loop and LLM clients are tested with fa
 ruff check src tests
 ```
 
-## License
-
-MIT

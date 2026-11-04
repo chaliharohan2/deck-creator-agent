@@ -232,7 +232,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
         pass
     s = settings_from_args(args)
     _header(s)
-    console.print(f"[dim]{CHAT_HELP}[/]")
+    console.print(f"[dim]{escape(CHAT_HELP)}[/]")
     agent = _build_agent(s, interactive=True, verbose=args.verbose)
     while True:
         try:
@@ -245,7 +245,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
         if line in ("/quit", "/exit", "/q"):
             break
         if line == "/help":
-            console.print(CHAT_HELP)
+            console.print(escape(CHAT_HELP))
             continue
         if line == "/slides":
             console.print(escape(agent.session.deck.outline()))

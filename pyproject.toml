@@ -8,12 +8,10 @@ version = "0.1.0"
 description = "A fully local, open-source AI agent that researches topics on the web and builds presentation decks (PPTX, PDF, HTML)."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
 authors = [{ name = "Rohan Chaliha" }]
 keywords = ["llm", "agent", "presentation", "pptx", "ollama", "local-llm", "slides"]
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
 # Every runtime dependency is OSI-licensed open source (see docs/LICENSES.md).

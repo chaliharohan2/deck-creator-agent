@@ -134,6 +134,8 @@ def normalize_series(v: Any) -> Any:
     if isinstance(v, list):
         fixed = []
         for i, s in enumerate(v):
+            if isinstance(s, (list, tuple)):  # [[1, 2], [3, 4]]: bare value arrays
+                s = {"name": f"Series {i + 1}", "values": list(s)}
             if isinstance(s, dict):
                 if "values" not in s:
                     for alt in ("data", "value", "y", "points"):

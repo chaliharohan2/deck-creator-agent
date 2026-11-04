@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -238,6 +239,21 @@ def _bullet_warnings(bullets: list[str]) -> str:
     return (" Tip: " + "; ".join(notes) + ".") if notes else ""
 
 
+_FIGURE = re.compile(
+    r"\d[\d,.]*\s?(%|percent|per ?cent|million|billion|trillion|bn\b|mn\b|[kmb]\b)|[$€£¥₹]\s?\d|\d\s?(gw|mw|kwh|twh|t\b|tonnes?)",
+    re.IGNORECASE,
+)
+
+
+def _unsourced_figures_warning(texts: list[str], sources: list[str]) -> str:
+    """Small models invent statistics. Flag specific figures that come with no source."""
+    if sources or not any(_FIGURE.search(t or "") for t in texts):
+        return ""
+    return (" Warning: this slide states specific figures but has no `sources`. If the numbers did not come "
+            "from the user or from a page you read, rewrite the slide without precise figures (update_slide); "
+            "otherwise add the source URL.")
+
+
 def _added(session: DeckSession, index: int, slide: Any, extra: str = "") -> str:
     return (f"Added slide {index} ({slide.kind}): \"{slide.heading}\". "
             f"The deck now has {len(session.deck.slides)} slides.{extra}")
@@ -279,7 +295,8 @@ def register_deck_tools(registry: ToolRegistry, session: DeckSession) -> None:
     def add_bullet_slide(a: BulletArgs) -> str:
         _ensure_title_slide(session)
         slide = BulletSlide(title=a.title, bullets=a.bullets, notes=a.notes, sources=a.sources)
-        return _added(session, session.insert(slide, a.position), slide, _bullet_warnings(slide.bullets))
+        extra = _bullet_warnings(slide.bullets) + _unsourced_figures_warning([slide.title, *slide.bullets], slide.sources)
+        return _added(session, session.insert(slide, a.position), slide, extra)
 
     @registry.add("add_two_column_slide", "Add a slide comparing two things side by side (pros/cons, before/after, A vs B).",
                   TwoColumnArgs)
@@ -288,7 +305,8 @@ def register_deck_tools(registry: ToolRegistry, session: DeckSession) -> None:
         slide = TwoColumnSlide(title=a.title, left_heading=a.left_heading, left_bullets=a.left_bullets,
                                right_heading=a.right_heading, right_bullets=a.right_bullets,
                                notes=a.notes, sources=a.sources)
-        return _added(session, session.insert(slide, a.position), slide)
+        extra = _unsourced_figures_warning([slide.title, *slide.left_bullets, *slide.right_bullets], slide.sources)
+        return _added(session, session.insert(slide, a.position), slide, extra)
 
     @registry.add("add_chart_slide",
                   "Add a native, editable chart. Use only real numbers from the user or from pages you read.", ChartArgs)
@@ -300,14 +318,17 @@ def register_deck_tools(registry: ToolRegistry, session: DeckSession) -> None:
             y_axis_title=a.y_axis_title, x_axis_title=a.x_axis_title, bullets=a.takeaways,
             notes=a.notes, sources=a.sources,
         )
-        extra = "" if a.sources else " Tip: add the data source URL in `sources`."
+        extra = "" if a.sources else (
+            " Warning: this chart has no `sources`. Charts must use real numbers from the user or from pages you "
+            "read; add the source URL, or delete the slide if the numbers were estimated.")
         return _added(session, session.insert(slide, a.position), slide, extra)
 
     @registry.add("add_table_slide", "Add a slide with a table (structured comparisons, specs, timelines).", TableArgs)
     def add_table_slide(a: TableArgs) -> str:
         _ensure_title_slide(session)
         slide = TableSlide(title=a.title, headers=a.headers, rows=a.rows, notes=a.notes, sources=a.sources)
-        return _added(session, session.insert(slide, a.position), slide)
+        cells = [slide.title, *slide.headers, *(c for row in slide.rows for c in row)]
+        return _added(session, session.insert(slide, a.position), slide, _unsourced_figures_warning(cells, slide.sources))
 
     @registry.add("add_image_slide",
                   "Add a slide with an image (URL from search_images, or a local file) and optional bullets.", ImageArgs)
@@ -330,7 +351,12 @@ def register_deck_tools(registry: ToolRegistry, session: DeckSession) -> None:
     def add_quote_slide(a: QuoteArgs) -> str:
         _ensure_title_slide(session)
         slide = QuoteSlide(quote=a.quote, attribution=a.attribution, notes=a.notes, sources=a.sources)
-        return _added(session, session.insert(slide, a.position), slide)
+        extra = ""
+        if slide.attribution and not slide.sources:
+            extra = (" Warning: a quotation attributed to someone needs the URL of the page where you read it in "
+                     "`sources`. If you wrote this statement yourself, remove the attribution (update_slide cannot "
+                     "do this: delete the slide and add it again without `attribution`).")
+        return _added(session, session.insert(slide, a.position), slide, extra)
 
     @registry.add("list_slides", "Show the current outline of the deck with slide numbers.", NoArgs)
     def list_slides(_: NoArgs) -> str:
