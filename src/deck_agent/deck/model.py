@@ -62,7 +62,7 @@ def normalize_bullets(value: Any) -> list[str]:
     else:
         items = [str(value)]
 
-    items = [i.rstrip() for i in items if i and i.strip()]
+    items = [i.rstrip() for raw in items for i in _unwrap_json_fragment(raw) if i and i.strip()]
     if not items:
         return []
 
@@ -87,6 +87,22 @@ def normalize_bullets(value: Any) -> list[str]:
         else:
             out.append(text)
     return out
+
+
+def _unwrap_json_fragment(item: str) -> list[str]:
+    """Models sometimes send '["a", "b"]' or '"a"' as one bullet; unwrap such fragments."""
+    text = item.strip().rstrip(",")
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            value = json.loads(text)
+            if isinstance(value, list):
+                return [str(v) for v in value if v is not None]
+        except json.JSONDecodeError:
+            text = text[1:-1].strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        text = text[1:-1]
+    indent = item[: len(item) - len(item.lstrip())]
+    return [indent + text]
 
 
 def bullet_level(item: str) -> tuple[int, str]:

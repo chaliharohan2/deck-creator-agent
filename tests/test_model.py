@@ -25,6 +25,8 @@ from deck_agent.deck.model import (
         (["- a", "  - sub", "- b"], ["a", "- sub", "b"]),  # indented marker is a sub-point
         ([{"text": "a", "sub": ["x"]}], ["a", "- x"]),
         (["- orphan"], ["orphan"]),
+        ('["a"]\n["b", "c"]', ["a", "b", "c"]),  # JSON fragments sent as one string
+        (['"quoted"', "'single'"], ["quoted", "single"]),
         (None, []),
     ],
 )

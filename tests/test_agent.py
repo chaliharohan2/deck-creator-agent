@@ -27,7 +27,8 @@ class NoSearch:
     name = "none"
 
     def text(self, q, n):
-        return [{"title": "Heat pump sales", "url": "https://example.org/hp", "snippet": "3 million units"}]
+        return [{"title": "Heat pump sales", "url": "https://example.org/hp",
+                 "snippet": "2.6 million units in 2024 and 3 million units in 2025"}]
 
     def images(self, q, n):
         return []
@@ -74,7 +75,7 @@ def test_errors_are_fed_back_and_corrected(tmp_path):
         "done",
     ]
     agent, events = make_agent(tmp_path, script)
-    result = agent.run("x")
+    result = agent.run("Chart these values: a=1, b=2")
     assert result.errors == 1
     assert any("one-to-one" in m["content"] for m in agent.messages if m["role"] == "tool")
     assert any(k == "autosave" for k, _ in events)  # the model never called save_deck

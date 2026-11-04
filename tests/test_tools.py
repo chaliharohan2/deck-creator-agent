@@ -67,6 +67,7 @@ def test_full_deck_flow(setup, tmp_path, png):
     r = ok("set_deck_info", title="Heat Pumps", subtitle="Europe 2026", theme="forest")
     assert r.ok and session.deck.theme == "forest"
     assert ok("add_bullet_slide", title="Why", bullets="- a\n- b\n- c").ok
+    session.note_source("EHPA: sales were 2.1 million in 2022 and 3,000 thousand in 2023")
     r = ok("add_chart_slide", title="Sales", chart_type="column", categories=[2022, 2023],
            series=[{"name": "Units (m)", "values": ["2.1", "3,000"]}], sources=["https://ehpa.org"])
     assert r.ok, r.content
@@ -312,3 +313,41 @@ def test_user_formats_are_a_floor(tmp_path):
     session.deck.slides.append(BulletSlide(title="t", bullets=["b"]))
     paths, _ = session.save(formats=["pptx"])
     assert {"pptx", "html"} <= set(paths)
+
+
+def test_chart_with_invented_values_is_rejected(setup):
+    registry, session, _ = setup
+    session.note_source("Units sold in 2025: France 528,000, Italy 423,000. Germany grew 50%.")
+    r = registry.execute("add_chart_slide", {"title": "Sales", "categories": ["France", "Italy", "Germany"],
+                                             "series": [{"name": "k units", "values": [528, 423, 1450]}]})
+    assert not r.ok and "Germany=1450" in r.content and "France" not in r.content
+    assert not any(sl.kind == "chart" for sl in session.deck.slides)
+    r = registry.execute("add_chart_slide", {"title": "Sales", "categories": ["France", "Italy"],
+                                             "series": [{"name": "m units", "values": [0.528, 0.423]}]})
+    assert r.ok, r.content  # scaled values are fine
+
+
+def test_chart_without_any_source_material(tmp_path):
+    registry = build_registry(Settings(web=False), DeckSession(output_dir=tmp_path))
+    r = registry.execute("add_chart_slide", {"title": "c", "categories": ["a"], "series": [[42]]})
+    assert not r.ok and "no source material" in r.content
+    lenient = build_registry(Settings(web=False), DeckSession(output_dir=tmp_path, verify_numbers=False))
+    assert lenient.execute("add_chart_slide", {"title": "c", "categories": ["a"], "series": [[42]]}).ok
+
+
+def test_unverified_figures_in_text_are_flagged(setup):
+    registry, session, _ = setup
+    session.note_source("Heat pump sales rose 13% in 2025 to 2.9 million units.")
+    r = registry.execute("add_bullet_slide", {"title": "Market", "bullets": ["Sales rose 13% to 2.9 million",
+                                                                           "Market grew 35% in 2024"]})
+    assert r.ok and "35%" in r.content and "13%" not in r.content.split("do not appear")[1]
+
+
+def test_duplicate_slides_are_refused(setup):
+    registry, session, _ = setup
+    assert registry.execute("add_bullet_slide", {"title": "Next steps", "bullets": ["a", "b"]}).ok
+    r = registry.execute("add_bullet_slide", {"title": "next  STEPS", "bullets": ["c"]})
+    assert not r.ok and "already has this title" in r.content and "move_slide" in r.content
+    r = registry.execute("add_bullet_slide", {"title": "Recommendations", "bullets": ["a", "b"]})
+    assert not r.ok and "already has this content" in r.content
+    assert registry.execute("add_section_slide", {"title": "Next steps"}).ok  # different kind is fine

@@ -47,6 +47,8 @@ def _add_agent_args(p: argparse.ArgumentParser) -> None:
     g.add_argument("--slides", type=int, help="default number of slides when the request does not say")
     g.add_argument("--max-steps", type=int, help="maximum model turns per request (default 60)")
     g.add_argument("--no-web", action="store_true", help="disable web research tools (fully offline)")
+    g.add_argument("--no-fact-check", action="store_true",
+                   help="allow numbers that do not appear in any source (e.g. for illustrative decks)")
     g.add_argument("--search-backend", choices=["ddgs", "searxng", "wikipedia"],
                    help="web search provider (default ddgs, with Wikipedia as fallback)")
     g.add_argument("--searxng-url", help="URL of your SearXNG instance")
@@ -102,6 +104,8 @@ def settings_from_args(args: argparse.Namespace) -> Settings:
             setattr(s, attr, value)
     if getattr(args, "no_web", False):
         s.web = False
+    if getattr(args, "no_fact_check", False):
+        s.verify_numbers = False
     return s
 
 
@@ -178,7 +182,7 @@ def _build_agent(s: Settings, interactive: bool, verbose: bool):
     from deck_agent.tools import DeckSession, build_registry
 
     session = DeckSession(output_dir=s.output_dir, formats=s.formats, default_theme=s.theme,
-                          allow_private_urls=s.allow_private_urls)
+                          allow_private_urls=s.allow_private_urls, verify_numbers=s.verify_numbers)
     registry = build_registry(s, session)
     llm = _make_llm(s)
     agent = DeckAgent(llm, registry, session, s, interactive=interactive, on_event=ConsoleReporter(verbose))

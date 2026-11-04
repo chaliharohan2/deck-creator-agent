@@ -38,7 +38,7 @@ SYSTEM_PROMPT = """You are DeckSmith, an expert presentation designer and resear
 - One idea per slide. Make the title the key message ("Solar costs fell 90% since 2010", not "Solar costs").
 - 3-6 bullets per slide, each under 15 words. No paragraphs. Put explanations in `notes` (speaker notes).
 - Vary the slide types: two-column for comparisons, table for structured facts, chart for numbers, quote for an impactful statement, section slides between parts.
-- Charts need real numbers from the user or from pages you read. Never invent statistics. Values must be plain numbers; put units in y_axis_title.
+- Charts need real numbers from the user or from pages you read. Never invent or estimate statistics: numbers are checked against your sources and charts with unsupported values are rejected. Values must be plain numbers; put units in y_axis_title.
 - Put the URLs of pages you used in the slide's `sources`.
 - If a tool returns an error, correct the arguments and call it again.
 {mode_rules}"""
@@ -149,7 +149,7 @@ class DeckAgent:
     # ------------------------------------------------------------------ main loop
     def run(self, user_message: str) -> AgentResult:
         self.registry.new_request()
-        self.session.note_urls(user_message)  # URLs the user supplied are legitimate sources
+        self.session.note_source(user_message)  # the user's URLs and numbers are legitimate sources
         self.messages.append({"role": "user", "content": user_message})
         result = AgentResult(text="")
         nudges = 0

@@ -70,7 +70,7 @@ def register_web_tools(registry: ToolRegistry, backend: SearchBackend, *, max_pa
         rows = backend.text(a.query, a.max_results)
         used["empty_in_a_row"] = 0 if rows else used["empty_in_a_row"] + 1
         if session is not None:
-            session.note_urls(" ".join(r.get("url", "") for r in rows))
+            session.note_source(" ".join(f"{r.get('url', '')} {r.get('title', '')} {r.get('snippet', '')}" for r in rows))
         return format_search_results(rows)
 
     @registry.add("read_webpage", "Read the main text of a web page or PDF to get facts and numbers.", ReadArgs)
@@ -78,7 +78,7 @@ def register_web_tools(registry: ToolRegistry, backend: SearchBackend, *, max_pa
         spend("read_webpage", max_reads)
         text = fetch_page(a.url, max_chars=max_page_chars, allow_private=allow_private)
         if session is not None:
-            session.note_urls(a.url + " " + text[:600])  # requested URL and the final URL after redirects
+            session.note_source(a.url + " " + text)  # requested + final URL, and the page's numbers
         return text
 
     if images:

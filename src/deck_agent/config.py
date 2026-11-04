@@ -50,6 +50,7 @@ class Settings:
     max_searches: int = 4  # per request; keeps small models from researching forever
     max_reads: int = 4
     allow_private_urls: bool = False
+    verify_numbers: bool = True  # reject chart values / flag figures that appear in no source the agent saw
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -80,4 +81,5 @@ class Settings:
         s.max_searches = int(_env("MAX_SEARCHES", str(s.max_searches)))
         s.max_reads = int(_env("MAX_READS", str(s.max_reads)))
         s.allow_private_urls = _env_bool("ALLOW_PRIVATE_URLS", s.allow_private_urls)
+        s.verify_numbers = _env_bool("VERIFY_NUMBERS", s.verify_numbers)
         return s

@@ -28,6 +28,7 @@ from deck_agent.deck.model import (
 )
 from deck_agent.deck.render import PdfExportError, render_deck, safe_filename
 from deck_agent.deck.themes import THEMES
+from deck_agent.factcheck import NumberCorpus, find_figures, number_figure
 from deck_agent.tools.base import NoArgs, ToolArgs, ToolError, ToolRegistry
 
 ThemeName = Literal["light", "dark", "corporate", "warm", "forest", "minimal"]
@@ -49,6 +50,8 @@ class DeckSession:
     saved: dict[str, Path] = field(default_factory=dict)
     basename: str | None = None
     known_urls: set[str] = field(default_factory=set)  # URLs the agent actually saw (search, pages, user)
+    facts: NumberCorpus = field(default_factory=NumberCorpus)  # numbers the agent actually saw
+    verify_numbers: bool = True
 
     def __post_init__(self) -> None:
         if self.default_theme:
@@ -63,6 +66,11 @@ class DeckSession:
         self.dirty = False
         self.saved = {}
         self.basename = None
+
+    def note_source(self, text: str) -> None:
+        """Record material the agent genuinely saw: its URLs and its numbers."""
+        self.note_urls(text)
+        self.facts.add_text(text)
 
     def note_urls(self, text: str) -> None:
         """Remember URLs that genuinely appeared (search results, pages read, the user's message)."""
@@ -80,6 +88,11 @@ class DeckSession:
 
     def insert(self, slide: Any, position: int | None) -> int:
         slides = self.deck.slides
+        for number, existing in enumerate(slides, 1):
+            what = _duplicate(existing, slide)
+            if what:
+                raise ToolError(f"slide {number} already has this {what}. To reorder slides use move_slide; to change "
+                                "a slide use update_slide. Do not add a copy.")
         if position is None or position > len(slides):
             slides.append(slide)
             index = len(slides)
@@ -279,6 +292,40 @@ def _unsourced_figures_warning(texts: list[str], sources: list[str]) -> str:
             "otherwise add the source URL.")
 
 
+def _body(slide: Any) -> tuple:
+    if isinstance(slide, TwoColumnSlide):
+        return (*slide.left_bullets, *slide.right_bullets)
+    if isinstance(slide, ChartSlide):
+        return (*slide.categories, *(v for x in slide.series for v in x.values))
+    if isinstance(slide, TableSlide):
+        return tuple(c for row in slide.rows for c in row)
+    if isinstance(slide, QuoteSlide):
+        return (slide.quote,)
+    return tuple(getattr(slide, "bullets", ()) or ())
+
+
+def _duplicate(existing: Any, new: Any) -> str:
+    if existing.kind != new.kind or new.kind == "title":
+        return ""
+    norm = lambda t: " ".join(str(t).lower().split())  # noqa: E731
+    if norm(existing.heading) == norm(new.heading):
+        return "title"
+    if _body(new) and _body(new) == _body(existing):
+        return "content"
+    return ""
+
+
+def _check_numbers(session: DeckSession, texts: list[str]) -> str:
+    if not session.verify_numbers:
+        return ""
+    bad = session.facts.unsupported([f for t in texts for f in find_figures(t or "")])
+    if not bad:
+        return ""
+    return (f" Warning: these figures do not appear in the user's input or in any search result or page you read: "
+            f"{', '.join(dict.fromkeys(f.text for f in bad[:6]))}. Remove or correct them with update_slide unless "
+            "the user gave them to you.")
+
+
 def _vet_sources(session: DeckSession, slide: Any, texts: list[str]) -> str:
     """Drop cited URLs the agent never saw, then flag figures that are left without a source.
 
@@ -291,7 +338,7 @@ def _vet_sources(session: DeckSession, slide: Any, texts: list[str]) -> str:
         note = (f" Removed source(s) {', '.join(invented[:3])}: they did not appear in your search results, the pages "
                 "you read or the user's message. Only cite pages you actually used, and remove figures you cannot "
                 "source (update_slide).")
-    return note + _unsourced_figures_warning(texts, slide.sources)
+    return note + _check_numbers(session, texts) + _unsourced_figures_warning(texts, slide.sources)
 
 
 def _added(session: DeckSession, index: int, slide: Any, extra: str = "") -> str:
@@ -358,7 +405,18 @@ def register_deck_tools(registry: ToolRegistry, session: DeckSession) -> None:
             y_axis_title=a.y_axis_title, x_axis_title=a.x_axis_title, bullets=a.takeaways,
             notes=a.notes, sources=a.sources,
         )
-        extra = _vet_sources(session, slide, [])
+        if session.verify_numbers:
+            bad = [(cat, v) for x in slide.series for cat, v in zip(slide.categories, x.values, strict=True)
+                   if not session.facts.supports(number_figure(v))]
+            if bad and not len(session.facts):
+                raise ToolError("chart not added: there is no source material with numbers in this conversation, so "
+                                "the chart cannot be backed by data. Use a bullet slide without precise figures instead.")
+            if bad:
+                listed = ", ".join(f"{cat}={v:g}" for cat, v in bad[:8])
+                raise ToolError(f"chart not added: these values do not appear in the user's input or in any search "
+                                f"result or page you read: {listed}. Charts may only use numbers from your sources. "
+                                "Add the chart again with only the categories whose values you found.")
+        extra = _vet_sources(session, slide, [*slide.bullets])
         if not slide.sources:
             extra += (" Warning: this chart has no `sources`. Charts must use real numbers from the user or from "
                       "pages you read; add the source URL, or delete the slide if the numbers were estimated.")
