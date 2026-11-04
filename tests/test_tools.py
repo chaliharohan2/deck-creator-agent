@@ -121,6 +121,13 @@ def test_bullet_slide_creates_title_slide_from_deck_info(setup):
     assert session.deck.slides[0].kind == "title"
 
 
+def test_single_bullet_slide_gets_a_tip(setup):
+    registry, _, _ = setup
+    r = registry.execute("add_bullet_slide", {"title": "a", "bullets": ["only one point"]})
+    assert r.ok and "single bullet" in r.content
+    assert "single bullet" not in registry.execute("add_bullet_slide", {"title": "b", "bullets": ["x", "y"]}).content
+
+
 def test_long_bullets_get_a_tip(setup):
     registry, _, _ = setup
     r = registry.execute("add_bullet_slide", {"title": "a", "bullets": ["word " * 30]})

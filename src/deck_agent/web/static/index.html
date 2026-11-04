@@ -86,6 +86,12 @@
     </div>
     <div class="stage">
       <iframe id="frame" title="Deck preview" src="/api/preview.html"></iframe>
+      <div id="pages" class="pages" hidden>
+        <button type="button" class="nav prev" id="pagePrev" aria-label="Previous slide">‹</button>
+        <img id="pageImg" alt="Slide rendered from the PowerPoint file">
+        <button type="button" class="nav next" id="pageNext" aria-label="Next slide">›</button>
+        <span id="pageNum" class="page-num"></span>
+      </div>
       <div id="overlay" class="overlay" hidden><span class="spinner"></span><span id="overlayText">Rendering…</span></div>
     </div>
     <ol id="outline" class="outline" aria-label="Slides"></ol>

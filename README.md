@@ -33,15 +33,18 @@ Prefer a browser? Run `deck-agent ui --open` (see [Web UI](#web-ui)).
 
 ## Web UI
 
+![Deck Agent web UI: chat with step-by-step progress on the left, live slide preview, slide strip and download buttons on the right](docs/ui.png)
+
 ```bash
 deck-agent ui --open                    # http://127.0.0.1:7860
 deck-agent ui -m qwen3.6:35b --no-web   # same options as `run`
+deck-agent ui --deck decks/Heat_Pumps.deck.json   # open a saved deck to preview, edit or download
 ```
 
 * **Chat** on the left. Describe the deck, attach notes, reports or PDFs as source material, then ask for changes ("make slide 4 a comparison", "add a chart of the sales figures"). While the model works, every step shows up live: searches, pages read, slides added and errors it corrected. **Stop** interrupts it.
 * **Preview** on the right. The deck redraws as each slide is added. Click a slide in the strip to jump to it.
   * **Live preview** is instant and works without anything extra.
-  * **PowerPoint render** shows the actual `.pptx` as LibreOffice draws it, which is what your audience will see.
+  * **PowerPoint render** shows the actual `.pptx`, drawn by LibreOffice, as slide images. This is what your audience will see.
   * The theme menu restyles the deck instantly, without re-running the model.
 * **Download** PPTX, PDF, HTML or the editable JSON spec when you're happy. Copies are also kept in the output folder.
 * The top bar switches the model, web research and fact-checking between messages. **New deck** starts over.

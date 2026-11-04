@@ -8,7 +8,7 @@ const els = {
   chips: $("#attachments"), model: $("#model"), web: $("#web"), factcheck: $("#factcheck"),
   newDeck: $("#newDeck"), title: $("#deckTitle"), count: $("#deckCount"), theme: $("#theme"),
   frame: $("#frame"), overlay: $("#overlay"), overlayText: $("#overlayText"), outline: $("#outline"),
-  pdfTab: $("#pdfTab"), toast: $("#toast"),
+  pdfTab: $("#pdfTab"), toast: $("#toast"), pages: $("#pages"), pageImg: $("#pageImg"), pageNum: $("#pageNum"),
 };
 
 const ui = {
@@ -17,7 +17,8 @@ const ui = {
   current: 1,
   mode: "html",            // "html" (live preview) | "pdf" (PowerPoint render via LibreOffice)
   pdfAvailable: false,
-  pdfStaleVersion: -1,     // deck version currently shown in the PDF tab
+  pagesVersion: -1,        // deck version of the rendered page images
+  pageCount: 0,
   attachments: [],
   turn: null,              // { box, list, summary, steps, start }
   reloadTimer: null,
@@ -190,11 +191,13 @@ function setCurrent(n) {
 }
 
 function goToSlide(n) {
+  const max = ui.mode === "pdf" ? ui.pageCount : ui.deck.count;
+  n = Math.min(Math.max(1, n), Math.max(1, max));
   setCurrent(n);
   if (ui.mode === "html") {
     try { els.frame.contentWindow.location.hash = String(n); } catch { reloadPreview(); }
   } else {
-    showPdf(true);
+    showPage();
   }
 }
 
@@ -219,7 +222,7 @@ function schedulePreview() {
   clearTimeout(ui.reloadTimer);
   ui.reloadTimer = setTimeout(() => {
     if (ui.mode === "html") reloadPreview();
-    else if (!ui.running) showPdf(false);
+    else if (!ui.running) showPdf();
     else { els.overlay.hidden = false; els.overlayText.textContent = "The PowerPoint render refreshes when the agent finishes."; }
   }, 200);
 }
@@ -229,21 +232,23 @@ function reloadPreview() {
   els.frame.src = `/api/preview.html?v=${ui.deck.version}#${ui.current}`;
 }
 
-async function showPdf(navigateOnly) {
-  if (!ui.deck.count) { els.frame.src = "/api/preview.html"; return; }
-  if (navigateOnly && ui.pdfStaleVersion === ui.deck.version) {
-    els.frame.src = `/api/preview.pdf?v=${ui.deck.version}#page=${ui.current}`;
-    return;
-  }
+function showPage() {
+  els.pageImg.src = `/api/preview/page/${ui.current}.png?v=${ui.pagesVersion}`;
+  els.pageNum.textContent = `${ui.current} / ${ui.pageCount}`;
+}
+
+async function showPdf() {
+  if (!ui.deck.count) { els.pages.hidden = true; return; }
+  if (ui.pagesVersion === ui.deck.version) { showPage(); return; }
   els.overlay.hidden = false;
   els.overlayText.textContent = "Rendering the PowerPoint file with LibreOffice…";
-  const version = ui.deck.version;
   try {
-    const res = await fetch(`/api/preview.pdf?v=${version}`, { method: "GET" });
-    if (!res.ok) throw new Error((await res.json()).error || res.statusText);
-    await res.blob(); // warm the server-side cache; the iframe then loads the same URL
-    ui.pdfStaleVersion = version;
-    els.frame.src = `/api/preview.pdf?v=${version}#page=${ui.current}`;
+    const res = await fetch(`/api/preview/pages?v=${ui.deck.version}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || res.statusText);
+    ui.pagesVersion = data.version;
+    ui.pageCount = data.count;
+    showPage();
     els.overlay.hidden = true;
   } catch (err) {
     els.overlayText.textContent = `Could not render: ${err.message}`;
@@ -257,9 +262,11 @@ function setMode(mode) {
     t.classList.toggle("active", active);
     t.setAttribute("aria-selected", String(active));
   });
+  els.frame.hidden = mode !== "html";
+  els.pages.hidden = mode !== "pdf";
   if (mode === "html") reloadPreview();
   else if (ui.running) { els.overlay.hidden = false; els.overlayText.textContent = "The PowerPoint render refreshes when the agent finishes."; }
-  else showPdf(false);
+  else showPdf();
 }
 
 els.frame.addEventListener("load", () => {
@@ -270,6 +277,15 @@ els.frame.addEventListener("load", () => {
     w.addEventListener("hashchange", sync);
     sync();
   } catch { /* cross-origin (should not happen) */ }
+});
+
+$("#pagePrev").addEventListener("click", () => goToSlide(ui.current - 1));
+$("#pageNext").addEventListener("click", () => goToSlide(ui.current + 1));
+els.pageImg.addEventListener("click", () => goToSlide(ui.current + 1));
+document.addEventListener("keydown", (e) => {
+  if (ui.mode !== "pdf" || /^(TEXTAREA|INPUT|SELECT)$/.test(e.target.tagName)) return;
+  if (["ArrowRight", "PageDown", " "].includes(e.key)) { e.preventDefault(); goToSlide(ui.current + 1); }
+  if (["ArrowLeft", "PageUp"].includes(e.key)) { e.preventDefault(); goToSlide(ui.current - 1); }
 });
 
 /* ------------------------------------------------------------------ server events */
@@ -286,7 +302,7 @@ function handle(ev) {
       setRunning(ev.running);
       if (!ev.running) {
         endTurn(ev.seconds);
-        if (ui.mode === "pdf") showPdf(false);
+        if (ui.mode === "pdf") showPdf();
       }
       break;
     case "llm_start":

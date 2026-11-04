@@ -22,6 +22,13 @@ def test_invented_values_are_not_supported():
         assert not c.supports(number_figure(v)), v
 
 
+def test_one_digit_values_need_an_exact_match():
+    c = corpus()  # contains 2.9 (million) but no 3
+    assert not c.supports(number_figure(3))  # found in a real run: Norway=3 slipped through by rounding 2.9
+    c.add_text("France has around 7 million")
+    assert c.supports(number_figure(7)) and c.supports(number_figure(7_000_000))
+
+
 def test_find_figures_skips_years_and_small_integers():
     texts = [f.text for f in find_figures("In 2025 the top 3 markets sold 528,000 units (13%); Q4 rose 4.5%")]
     assert texts == ["528,000", "13%", "4.5%"]

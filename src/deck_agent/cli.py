@@ -76,6 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--host", default="127.0.0.1", help="interface to bind (default 127.0.0.1: this computer only)")
     p.add_argument("--port", type=int, default=7860)
     p.add_argument("--open", action="store_true", help="open the UI in your web browser")
+    p.add_argument("--deck", type=Path, help="open a saved .deck.json to preview, edit or download it")
 
     p = sub.add_parser("render", help="re-render a saved .deck.json without the LLM")
     p.add_argument("spec", type=Path)
@@ -289,7 +290,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
 def cmd_ui(args: argparse.Namespace) -> int:
     from deck_agent.web import serve
 
-    serve(settings_from_args(args), host=args.host, port=args.port, open_browser=args.open)
+    serve(settings_from_args(args), host=args.host, port=args.port, open_browser=args.open, deck_path=args.deck)
     return 0
 
 

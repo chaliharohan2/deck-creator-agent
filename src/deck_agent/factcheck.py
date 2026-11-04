@@ -76,10 +76,15 @@ class NumberCorpus:
         target = abs(fig.value)
         if target == 0:
             return True
+        # A one-digit value ("3", "50%") is too coarse for rounding: 3 would "match" 2.9 or 3.4.
+        exact = fig.sig < 2
         for c in self.values:
             for scale in _SCALES:
                 x = c * scale
-                if x and abs(_round_sig(x, fig.sig) - target) <= target * 1e-9:
+                if not x:
+                    continue
+                candidate = x if exact else _round_sig(x, fig.sig)
+                if abs(candidate - target) <= target * 1e-9:
                     return True
         return False
 

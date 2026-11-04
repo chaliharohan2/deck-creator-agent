@@ -148,6 +148,14 @@ def test_pdf_preview_is_cached_per_version(tmp_path):
     dl = client.get("/api/download/pdf")
     assert dl.status_code == 200 and 'filename="Heat_Pumps.pdf"' in dl.headers["content-disposition"]
 
+    # slide images of the real PPTX for the "PowerPoint render" tab
+    assert client.get("/api/preview/page/1.png").status_code in (200, 404)
+    pages = client.get("/api/preview/pages").json()
+    assert pages == {"version": state.deck_version, "count": 2}
+    img = client.get("/api/preview/page/2.png")
+    assert img.status_code == 200 and img.content.startswith(b"\x89PNG")
+    assert client.get("/api/preview/page/3.png").status_code == 404
+
 
 def test_busy_agent_rejects_second_message_and_can_be_stopped(tmp_path):
     gate = threading.Event()
@@ -221,6 +229,22 @@ def test_security_guards(tmp_path):
     assert form.status_code == 400  # only JSON bodies (forces a CORS preflight for cross-site requests)
     rebinding = client.get("/api/state", headers={"Host": "attacker.example"})
     assert rebinding.status_code == 400
+
+
+def test_open_saved_deck(tmp_path):
+    from deck_agent.sample import build_sample_deck
+
+    deck = build_sample_deck("warm", tmp_path / "assets")
+    settings = Settings(output_dir=tmp_path / "decks", web=False, model="fake:4b")
+    app = create_app(settings, llm_factory=Factory(script=["ok"]), initial_deck=deck, deck_name="mine.deck.json")
+    client = TestClient(app, base_url="http://127.0.0.1:7860")
+    state = client.get("/api/state").json()
+    assert state["deck"]["count"] == len(deck.slides) and state["deck"]["theme"] == "warm"
+    events = client.get("/api/events.json").json()["events"]
+    assert events[0]["type"] == "deck" and events[1]["type"] == "note" and "mine.deck.json" in events[1]["text"]
+    assert client.get("/api/download/pptx").status_code == 200
+    # numbers already in the user's deck count as sources for later edits
+    assert app.state.ui.session.facts.supports(number_figure(79.9))
 
 
 def test_event_log_collapses_progress_and_trims():

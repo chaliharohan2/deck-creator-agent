@@ -117,7 +117,8 @@ def _first_line(text: str, n: int = 240) -> str:
 # --------------------------------------------------------------------------- application state
 class UIState:
     def __init__(self, settings: Settings, llm_factory: LLMFactory | None = None,
-                 search_backend: SearchBackend | None = None):
+                 search_backend: SearchBackend | None = None, initial_deck: Deck | None = None,
+                 deck_name: str = ""):
         self.settings = settings
         self.llm_factory = llm_factory or default_llm_factory
         self.search_backend = search_backend
@@ -136,6 +137,14 @@ class UIState:
         self.preview_dir = Path(tempfile.mkdtemp(prefix="deck-agent-ui-"))
         self._pdf_lock = threading.Lock()
         self._pdf_cache: tuple[int, Path] | None = None
+        self._pages_cache: tuple[int, list[Path]] | None = None
+        if initial_deck is not None:
+            self.session.deck = initial_deck
+            # The opened file is the user's own material: its figures and links count as sources.
+            self.session.note_source(initial_deck.model_dump_json())
+            self.check_deck(focus=1)
+            self.events.add("note", text=f"Opened {deck_name or 'deck'} ({len(initial_deck.slides)} slides). "
+                                         "Preview it, ask for changes, or download it.")
 
     # ------------------------------------------------------------------ helpers
     def _registry(self):
@@ -318,6 +327,33 @@ class UIState:
             self._pdf_cache = (version, files["pdf"])
             return files["pdf"]
 
+    def preview_pages(self) -> tuple[int, list[Path]]:
+        """Slide images of the real PPTX (PPTX -> PDF via LibreOffice -> PNG via PDFium).
+
+        Images display in every browser, unlike PDFs in iframes (no viewer in headless
+        browsers or when the browser is set to download PDFs).
+        """
+        import pypdfium2 as pdfium
+
+        pdf = self.preview_pdf()
+        with self._pdf_lock:
+            version = self.deck_version
+            if self._pages_cache and self._pages_cache[0] == version and all(p.exists() for p in self._pages_cache[1]):
+                return self._pages_cache
+            out_dir = self.preview_dir / f"pages_{version}"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            doc = pdfium.PdfDocument(str(pdf))
+            pages = []
+            try:
+                for i, page in enumerate(doc, 1):
+                    path = out_dir / f"{i}.png"
+                    page.render(scale=1600 / page.get_width()).to_pil().save(path, optimize=True)
+                    pages.append(path)
+            finally:
+                doc.close()
+            self._pages_cache = (version, pages)
+            return self._pages_cache
+
     def download(self, fmt: str) -> tuple[Path, str]:
         deck = self.snapshot()
         base = safe_filename(deck.title, default="deck")
@@ -347,8 +383,9 @@ class SameOriginPostMiddleware:
 
 # --------------------------------------------------------------------------- routes
 def create_app(settings: Settings, *, llm_factory: LLMFactory | None = None,
-               search_backend: SearchBackend | None = None, allowed_hosts: list[str] | None = None) -> Starlette:
-    state = UIState(settings, llm_factory, search_backend)
+               search_backend: SearchBackend | None = None, allowed_hosts: list[str] | None = None,
+               initial_deck: Deck | None = None, deck_name: str = "") -> Starlette:
+    state = UIState(settings, llm_factory, search_backend, initial_deck=initial_deck, deck_name=deck_name)
 
     async def json_body(request: Request) -> dict[str, Any]:
         if "application/json" not in request.headers.get("content-type", ""):
@@ -457,6 +494,22 @@ def create_app(settings: Settings, *, llm_factory: LLMFactory | None = None,
         return FileResponse(path, media_type="application/pdf", content_disposition_type="inline",
                             filename="preview.pdf", headers={"Cache-Control": "no-store"})
 
+    async def preview_pages(_: Request) -> Response:
+        if not state.session.deck.slides:
+            return error("The deck has no slides yet.", 404)
+        try:
+            version, pages = await run_in_threadpool(state.preview_pages)
+        except PdfExportError as exc:
+            return error(str(exc), 501)
+        return JSONResponse({"version": version, "count": len(pages)})
+
+    async def preview_page(request: Request) -> Response:
+        cache = state._pages_cache
+        n = request.path_params["n"]
+        if not cache or not 1 <= n <= len(cache[1]):
+            return error("Render the pages first (GET /api/preview/pages).", 404)
+        return FileResponse(cache[1][n - 1], media_type="image/png", headers={"Cache-Control": "no-store"})
+
     async def download(request: Request) -> Response:
         fmt = request.path_params["fmt"]
         if fmt not in MEDIA_TYPES:
@@ -504,6 +557,8 @@ def create_app(settings: Settings, *, llm_factory: LLMFactory | None = None,
         Route("/api/events.json", events_json),
         Route("/api/preview.html", preview_html),
         Route("/api/preview.pdf", preview_pdf),
+        Route("/api/preview/pages", preview_pages),
+        Route("/api/preview/page/{n:int}.png", preview_page),
         Route("/api/download/{fmt}", download),
         Route("/api/extract", extract, methods=["POST"]),
         Mount("/static", StaticFiles(directory=STATIC_DIR), name="static"),
@@ -521,13 +576,15 @@ font:15px system-ui,sans-serif;color:#8a94a6;background:transparent}
 </style></head><body><div>Slides will appear here as the agent builds them.</div></body></html>"""
 
 
-def serve(settings: Settings, host: str = "127.0.0.1", port: int = 7860, open_browser: bool = False) -> None:
+def serve(settings: Settings, host: str = "127.0.0.1", port: int = 7860, open_browser: bool = False,
+          deck_path: Path | None = None) -> None:
     import uvicorn
 
     allowed = None
     if host not in ("127.0.0.1", "localhost", "::1"):
         allowed = ["*"] if host in ("0.0.0.0", "::") else [host, "127.0.0.1", "localhost"]
-    app = create_app(settings, allowed_hosts=allowed)
+    deck = Deck.load_json(deck_path) if deck_path else None
+    app = create_app(settings, allowed_hosts=allowed, initial_deck=deck, deck_name=deck_path.name if deck_path else "")
     url = f"http://{'127.0.0.1' if host in ('0.0.0.0', '::') else host}:{port}"
     print(f"deck-agent UI running at {url}  (model: {settings.model}; press Ctrl+C to stop)")
     if allowed:
