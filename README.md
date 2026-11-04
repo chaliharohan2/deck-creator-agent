@@ -69,7 +69,7 @@ deck-agent doctor      # checks model server, tool calling, web search, LibreOff
 
 The formats you pass with `-f` are always produced (the model can add formats, not remove them).
 
-Common options: `-m/--model`, `-f/--formats pptx pdf html`, `-t/--theme`, `-o/--out-dir`, `--slides N`, `--no-web`, `--think`, `--num-ctx`, `-v/--verbose` (shows every tool result). Run `deck-agent run -h` for all options.
+Common options: `-m/--model`, `-f/--formats pptx pdf html`, `-t/--theme`, `-o/--out-dir`, `--slides N`, `--no-web`, `--no-fact-check`, `--think`, `--num-ctx`, `-v/--verbose` (shows every tool result). Run `deck-agent run -h` for all options.
 
 ## What the agent can do (its tools)
 
@@ -107,9 +107,25 @@ Every slide can carry **speaker notes** and **sources**. Sources appear in a foo
 * **Simple, flat tool schemas.** One tool per slide type with flat parameters instead of one deeply nested "deck" object.
 * **Forgiving inputs, strict outputs.** Bullets sent as one string, `"45%"` instead of `45`, `2024` instead of `"2024"`, and `{"Revenue": [...]}` instead of a series list are all accepted. Mismatched chart data or oversized tables come back as precise, fixable errors.
 * **Guard rails.** Repeated identical calls are short-circuited, research is capped per request (`DECK_AGENT_MAX_SEARCHES`, default 4), and exhausted tools are removed from the tool list (small models ignore "stop searching" but not a missing tool). A model that only *describes* a plan is nudged to call tools.
-* **Citation checks.** Small models invent statistics *and* plausible-looking source URLs. A cited URL is kept only if the agent actually saw it, in search results, a page it read, or your own input. Invented URLs are removed, and the model is told about them. Slides with specific figures, charts or attributed quotes but no surviving source get a warning back to the model.
+* **Fact and citation checks.** Small models invent statistics *and* plausible-looking source URLs. Every number and URL the agent sees (your input, search snippets, pages it read) is recorded:
+  * a **chart** whose values appear in none of that material is **rejected**, with the unsupported values named, so the model has to chart only real data;
+  * figures in text slides that appear nowhere get a warning back to the model;
+  * a cited URL the agent never saw is **removed** from the slide.
+
+  This catches numbers and links that were made up outright, the common failure. It cannot prove a real number is used in the right context, so still review a deck before presenting it.
 * **Never lose work.** Old tool output is trimmed near the context limit, and an unsaved deck is always saved at the end.
 * **Thinking off by default.** Reasoning mode multiplies CPU time. Turn it on with `--think` on a GPU.
+
+## Tested end to end
+
+The agent was run against real local models on a 4-vCPU, CPU-only machine (Ollama 0.40.14):
+
+| Run | Result |
+|---|---|
+| `qwen3.5:4b`, web research on | 8 slides with chart, table, two-column and quote in 9.5 min. The first searches found real data (EHPA: 2.9 M heat pumps sold in 2025, +13%). The search engines then throttled the machine's shared IP. With research cut off, the model **invented figures and source URLs**, which is what led to the fact and citation checks above. |
+| `qwen3.5:9b`, `--request-file examples/heat_pumps_notes.md --no-web` | 10 slides in 15 min, 0 tool errors; every figure in the text slides matched the notes. The chart mixed two real and two **invented** values while citing the real source, which led to the number cross-check. It also added a duplicate slide, so duplicates are now refused. |
+
+These runs are why the guard rails exist. They are covered by unit tests with a scripted fake model (`tests/test_agent.py`, `tests/test_tools.py`, `tests/test_factcheck.py`).
 
 ## Configuration
 
@@ -131,6 +147,7 @@ Every option can also be set with an environment variable:
 | `DECK_AGENT_SEARXNG_URL` | `http://localhost:8888` | your SearXNG instance |
 | `DECK_AGENT_MAX_SEARCHES` / `_MAX_READS` | `4` / `4` | research budget per request |
 | `DECK_AGENT_IMAGE_LICENSE` | `Share` | image licence filter: `any`, `Public`, `Share`, `ShareCommercially`, `Modify`, `ModifyCommercially` |
+| `DECK_AGENT_VERIFY_NUMBERS` | `true` | cross-check slide numbers against sources (`--no-fact-check` to allow illustrative numbers) |
 | `DECK_AGENT_ALLOW_PRIVATE_URLS` | `false` | allow reading `localhost`/LAN pages (off by default to block prompt-injection tricks) |
 
 `HTTPS_PROXY` and `SSL_CERT_FILE` are honoured for web research, which helps behind corporate proxies.
@@ -171,7 +188,7 @@ Details: [docs/LICENSES.md](docs/LICENSES.md).
 
 ```bash
 pip install -e ".[dev]"
-pytest            # 80+ tests; the agent loop and LLM clients are tested with fakes/mocks, no model needed
+pytest            # ~100 tests; the agent loop and LLM clients use fakes/mocks, so no model is needed
 ruff check src tests
 ```
 

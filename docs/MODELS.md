@@ -71,13 +71,14 @@ All sizes above are Ollama's default **Q4_K_M** quantization unless stated. Q4_K
 
 ## Measured speed on a small CPU box
 
-These measurements come from the development sandbox (4 vCPU, 15 GB RAM, no GPU), Ollama 0.40.14:
+These measurements come from the development sandbox (4 vCPU, 15 GB RAM, no GPU), Ollama 0.40.14, Q4_K_M, and real agent runs:
 
-| Model | Prompt processing | Generation | One full 8-slide deck incl. web research |
+| Model | Generation | Prompt processing | Whole deck |
 |---|---|---|---|
-| `qwen3.5:4b` (Q4_K_M) | ~68 tok/s | ~6.6 tok/s | see `README.md` → "Tested end to end" |
+| `qwen3.5:4b` | ~6–7 tok/s | ~68 tok/s | 8 slides in **9.5 min** (incl. web-search attempts) |
+| `qwen3.5:9b` | ~3.5 tok/s | ~25–30 tok/s | 10 slides in **15 min** (from a notes file, offline) |
 
-A modern 8-core laptop is roughly 2× faster, and any recent GPU is 10–30× faster. Ollama caches the shared prompt prefix between steps, so only new text is re-processed. That makes multi-step agent runs practical even on a CPU.
+A typical step writes one slide (150–250 tokens). The first step is slowest (model load plus the ~3.5K-token system prompt and tool schemas). After that, Ollama reuses the cached prompt prefix, so each step only processes the new text. A modern 8-core laptop is roughly 2× faster; any recent GPU is 10–30× faster, at which point `--think` (reasoning mode) becomes affordable.
 
 ## Running without Ollama
 
