@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deck-creator-agent"
+version = "0.1.0"
+description = "A fully local, open-source AI agent that researches topics on the web and builds presentation decks (PPTX, PDF, HTML)."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Rohan Chaliha" }]
+keywords = ["llm", "agent", "presentation", "pptx", "ollama", "local-llm", "slides"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+# Every runtime dependency is OSI-licensed open source (see docs/LICENSES.md).
+dependencies = [
+    "python-pptx>=1.0.2",   # MIT      - PowerPoint writer
+    "pydantic>=2.7",        # MIT      - deck schema + tool argument validation
+    "httpx>=0.27",          # BSD-3    - HTTP client for the local LLM server and web pages
+    "ddgs>=9.0",            # MIT      - metasearch (DuckDuckGo, Bing, Brave, ...) with no API key
+    "trafilatura>=2.0",     # Apache-2 - main-text extraction from web pages
+    "pypdf>=4.0",           # BSD-3    - text extraction when a search result is a PDF
+    "Pillow>=10.0",         # MIT-CMU  - image validation/conversion
+    "rich>=13.0",           # MIT      - terminal UI
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.5"]
+
+[project.scripts]
+deck-agent = "deck_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]
