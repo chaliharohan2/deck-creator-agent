@@ -16,10 +16,12 @@ import hashlib
 import io
 import json
 import re
+import shutil
 import tempfile
 import threading
 import time
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -124,7 +126,7 @@ class UIState:
         self.search_backend = search_backend
         self.events = EventLog()
         self.session = DeckSession(output_dir=settings.output_dir, formats=["pptx"], default_theme=settings.theme,
-                                   allow_private_urls=settings.allow_private_urls,
+                                   theme_locked=bool(settings.theme), allow_private_urls=settings.allow_private_urls,
                                    verify_numbers=settings.verify_numbers)
         self.agent = DeckAgent(self.llm_factory(settings), self._registry(), self.session, settings,
                                interactive=True, on_event=self._on_agent_event)
@@ -239,29 +241,33 @@ class UIState:
             self.events.add("note", text="The model described a plan instead of building; asked it to continue.")
         elif kind == "autosave":
             self.events.add("saved", files=data["files"])
+        elif kind == "autosave_error":
+            self.events.add("error", text=f"Could not save the deck to the output folder: {data['error']}")
 
     # ------------------------------------------------------------------ actions
     def start_chat(self, message: str, attachments: list[dict[str, str]]) -> tuple[bool, str]:
         with self.lock:
             if self.running:
                 return False, "The agent is still working on the previous message."
-            prompt, names, truncated = message.strip(), [], False
+            prompt, names, omitted, truncated = message.strip(), [], [], False
             budget = MAX_ATTACHMENT_CHARS
             for att in attachments:
                 text = str(att.get("text", "")).strip()
                 name = str(att.get("name", "attachment"))[:120]
                 if not text:
                     continue
+                if budget <= 0:  # no room left: say so instead of dropping the file silently
+                    omitted.append(name)
+                    continue
                 if len(text) > budget:
                     text, truncated = text[:budget] + "\n[... truncated]", True
                 budget -= len(text)
                 names.append(name)
                 prompt += f"\n\nSource material from the file '{name}':\n{text}"
-                if budget <= 0:
-                    break
             if not prompt:
                 return False, "Empty message."
-            self.events.add("user", text=message.strip(), attachments=names, truncated=truncated)
+            self.events.add("user", text=message.strip(), attachments=names, truncated=truncated or bool(omitted),
+                            omitted=omitted)
             self.events.add("status", running=True)
             self._turn_started = time.time()
             self.thread = threading.Thread(target=self._run, args=(prompt,), daemon=True, name="deck-agent")
@@ -274,9 +280,13 @@ class UIState:
             self.check_deck()
             if result.stopped_reason == "cancelled":
                 self.events.add("note", text="Stopped.")
-            elif result.text and result.stopped_reason != "llm_error":
+            elif result.stopped_reason == "llm_error":
+                pass  # already shown as an error
+            elif result.text:
                 self.events.add("assistant", text=result.text, stopped_reason=result.stopped_reason,
                                 tool_calls=result.tool_calls, steps=result.steps)
+            else:
+                self.events.add("note", text="The model finished without a written reply.")
         except Exception as exc:  # noqa: BLE001 - surface any crash in the chat instead of dying silently
             self.events.add("error", text=f"{exc.__class__.__name__}: {exc}")
         finally:
@@ -289,7 +299,8 @@ class UIState:
     def reset(self) -> None:
         self.agent.reset()
         self.events.clear()
-        self._pdf_cache = None
+        with self._pdf_lock:
+            self._pdf_cache = self._pages_cache = None
         self.deck_version += 1
         self._deck_fp = self._fingerprint()
         self.events.add("reset", **self.deck_info())
@@ -314,18 +325,36 @@ class UIState:
         if theme not in THEMES:
             raise ValueError(f"unknown theme {theme!r}")
         self.session.deck.theme = theme
+        self.session.theme_locked = True  # the user's pick: the model keeps it unless asked to change it
         self.session.dirty = True
         self.check_deck()
 
     # ------------------------------------------------------------------ rendering
+    def _render_preview_pdf(self) -> tuple[int, Path]:
+        """``(deck version, PDF)``; call with ``_pdf_lock`` held."""
+        version = self.deck_version  # read before the snapshot: a later edit only makes the cache stale
+        if self._pdf_cache and self._pdf_cache[0] == version and self._pdf_cache[1].exists():
+            return self._pdf_cache
+        deck = self.snapshot()
+        self._remove_previews()
+        self._pdf_cache = self._pages_cache = None  # the files are gone, even if this render fails
+        files = render_deck(deck, self.preview_dir, f"preview_{version}", ["pdf"])
+        self._pdf_cache = (version, files["pdf"])
+        return self._pdf_cache
+
+    def _remove_previews(self) -> None:
+        """Delete superseded preview files so the temp folder does not grow with every edit."""
+        for path in self.preview_dir.glob("preview_*"):
+            path.unlink(missing_ok=True)
+        for folder in self.preview_dir.glob("pages_*"):
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def close(self) -> None:
+        shutil.rmtree(self.preview_dir, ignore_errors=True)
+
     def preview_pdf(self) -> Path:
         with self._pdf_lock:
-            version = self.deck_version
-            if self._pdf_cache and self._pdf_cache[0] == version and self._pdf_cache[1].exists():
-                return self._pdf_cache[1]
-            files = render_deck(self.snapshot(), self.preview_dir, f"preview_{version}", ["pdf"])
-            self._pdf_cache = (version, files["pdf"])
-            return files["pdf"]
+            return self._render_preview_pdf()[1]
 
     def preview_pages(self) -> tuple[int, list[Path]]:
         """Slide images of the real PPTX (PPTX -> PDF via LibreOffice -> PNG via PDFium).
@@ -335,9 +364,9 @@ class UIState:
         """
         import pypdfium2 as pdfium
 
-        pdf = self.preview_pdf()
         with self._pdf_lock:
-            version = self.deck_version
+            # One lock for both steps, so the images always come from the PDF of the version they report.
+            version, pdf = self._render_preview_pdf()
             if self._pages_cache and self._pages_cache[0] == version and all(p.exists() for p in self._pages_cache[1]):
                 return self._pages_cache
             out_dir = self.preview_dir / f"pages_{version}"
@@ -373,7 +402,7 @@ class SameOriginPostMiddleware:
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "http" and scope["method"] not in ("GET", "HEAD", "OPTIONS"):
-            headers = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
+            headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]}
             origin, host = headers.get("origin"), headers.get("host", "")
             if origin and urlparse(origin).netloc != host:
                 await JSONResponse({"error": "cross-origin request refused"}, status_code=403)(scope, receive, send)
@@ -474,7 +503,10 @@ def create_app(settings: Settings, *, llm_factory: LLMFactory | None = None,
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     async def events_json(request: Request) -> Response:
-        since = int(request.query_params.get("since", 0))
+        try:
+            since = int(request.query_params.get("since") or 0)
+        except ValueError:
+            return error("since must be an integer")
         return JSONResponse({"events": state.events.since(since), "running": state.running})
 
     async def preview_html(_: Request) -> Response:
@@ -506,7 +538,7 @@ def create_app(settings: Settings, *, llm_factory: LLMFactory | None = None,
     async def preview_page(request: Request) -> Response:
         cache = state._pages_cache
         n = request.path_params["n"]
-        if not cache or not 1 <= n <= len(cache[1]):
+        if not cache or not 1 <= n <= len(cache[1]) or not cache[1][n - 1].exists():
             return error("Render the pages first (GET /api/preview/pages).", 404)
         return FileResponse(cache[1][n - 1], media_type="image/png", headers={"Cache-Control": "no-store"})
 
@@ -525,17 +557,21 @@ def create_app(settings: Settings, *, llm_factory: LLMFactory | None = None,
     async def extract(request: Request) -> Response:
         """Turn an attached file (PDF or text) into plain text for the prompt."""
         name = request.query_params.get("name", "file")
-        data = b""
+        buf = bytearray()
         async for chunk in request.stream():
-            data += chunk
-            if len(data) > MAX_UPLOAD_BYTES:
+            buf.extend(chunk)
+            if len(buf) > MAX_UPLOAD_BYTES:
                 return error("File is larger than 20 MB.", 413)
+        data = bytes(buf)
         if name.lower().endswith(".pdf") or data[:5] == b"%PDF-":
             from pypdf import PdfReader
 
-            try:
-                reader = await run_in_threadpool(PdfReader, io.BytesIO(data))
-                text = "\n".join((p.extract_text() or "") for p in reader.pages[:60])
+            def pdf_text() -> str:
+                reader = PdfReader(io.BytesIO(data))
+                return "\n".join((p.extract_text() or "") for p in reader.pages[:60])
+
+            try:  # off the event loop: a long PDF must not freeze the progress stream
+                text = await run_in_threadpool(pdf_text)
             except Exception as exc:  # noqa: BLE001 - malformed PDFs are common
                 return error(f"Could not read the PDF ({exc.__class__.__name__}).", 422)
         else:
@@ -565,7 +601,13 @@ def create_app(settings: Settings, *, llm_factory: LLMFactory | None = None,
     ]
     hosts = allowed_hosts or ["127.0.0.1", "localhost", "[::1]", "::1"]
     middleware = [Middleware(TrustedHostMiddleware, allowed_hosts=hosts), Middleware(SameOriginPostMiddleware)]
-    app = Starlette(routes=routes, middleware=middleware)
+
+    @asynccontextmanager
+    async def lifespan(_: Starlette):
+        yield
+        state.close()  # remove the preview temp folder when the server stops
+
+    app = Starlette(routes=routes, middleware=middleware, lifespan=lifespan)
     app.state.ui = state
     return app
 

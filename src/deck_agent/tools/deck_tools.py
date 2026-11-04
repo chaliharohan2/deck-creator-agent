@@ -23,8 +23,10 @@ from deck_agent.deck.model import (
     TitleSlide,
     TwoColumnSlide,
     normalize_chart_type,
+    normalize_headers,
+    normalize_rows,
     normalize_series,
-    parse_number,
+    parse_values,
 )
 from deck_agent.deck.render import PdfExportError, render_deck, safe_filename
 from deck_agent.deck.themes import THEMES
@@ -52,10 +54,15 @@ class DeckSession:
     known_urls: set[str] = field(default_factory=set)  # URLs the agent actually saw (search, pages, user)
     facts: NumberCorpus = field(default_factory=NumberCorpus)  # numbers the agent actually saw
     verify_numbers: bool = True
+    # The user chose the theme (--theme, the UI's theme menu): the model may not change it
+    # unless the current request asks for a theme (`theme_requested`, set per request).
+    theme_locked: bool = False
+    theme_requested: bool = False
 
     def __post_init__(self) -> None:
         if self.default_theme:
             self.deck.theme = self.default_theme
+        self._initial_lock = self.theme_locked
 
     @property
     def assets_dir(self) -> Path:
@@ -66,6 +73,10 @@ class DeckSession:
         self.dirty = False
         self.saved = {}
         self.basename = None
+        # A new deck starts a new conversation: material seen for the old one no longer counts.
+        self.known_urls = set()
+        self.facts = NumberCorpus()
+        self.theme_locked = self._initial_lock
 
     def note_source(self, text: str) -> None:
         """Record material the agent genuinely saw: its URLs and its numbers."""
@@ -93,6 +104,12 @@ class DeckSession:
             if what:
                 raise ToolError(f"slide {number} already has this {what}. To reorder slides use move_slide; to change "
                                 "a slide use update_slide. Do not add a copy.")
+        # First slide of a deck whose title is known (e.g. every slide was deleted to start over):
+        # open it with the title slide. Never re-adds a title slide the user moved or deleted.
+        if not slides and not isinstance(slide, TitleSlide) and self.deck.title != Deck.model_fields["title"].default:
+            d = self.deck
+            slides.append(TitleSlide(title=d.title, subtitle=d.subtitle, author=d.author, date=d.date))
+            position = None  # the new slide follows the title slide
         if position is None or position > len(slides):
             slides.append(slide)
             index = len(slides)
@@ -115,7 +132,7 @@ class DeckSession:
         if not self.basename:
             self.basename = safe_filename(self.deck.title, default="deck")
         # The user's configured formats are a floor; the model may add formats but not drop them.
-        fmts = list(dict.fromkeys([*self.formats, *(formats or [])]))
+        fmts = list(dict.fromkeys(f.strip().lower().lstrip(".") for f in [*self.formats, *(formats or [])]))
         note = ""
         try:
             paths = render_deck(self.deck, self.output_dir, self.basename, fmts)
@@ -166,9 +183,7 @@ class SeriesArg(ToolArgs):
     @field_validator("values", mode="before")
     @classmethod
     def _values(cls, v: Any) -> list[float]:
-        if isinstance(v, (int, float, str)):
-            v = [v]
-        return [parse_number(x) for x in (v or [])]
+        return parse_values(v)
 
 
 class ChartArgs(ToolArgs):
@@ -203,6 +218,17 @@ class TableArgs(ToolArgs):
     notes: str = _NOTES
     sources: list[str] = _SOURCES
     position: int | None = _POSITION
+
+    # Same forgiving shapes as TableSlide: rows as dicts, "a | b" strings, a markdown table, empty cells.
+    @field_validator("headers", mode="before")
+    @classmethod
+    def _headers(cls, v: Any) -> list[str]:
+        return normalize_headers(v)
+
+    @field_validator("rows", mode="before")
+    @classmethod
+    def _rows(cls, v: Any) -> list[list[str]]:
+        return normalize_rows(v)
 
 
 class ImageArgs(ToolArgs):
@@ -271,7 +297,9 @@ def _bullet_warnings(bullets: list[str]) -> str:
     return (" Tip: " + "; ".join(notes) + ".") if notes else ""
 
 
-_URL = re.compile(r"https?://[^\s<>\"'()\[\]{}]+")
+# Balanced parentheses are part of a URL (Wikipedia: ".../Mercury_(planet)"); an unbalanced
+# ")" is not (a markdown link "[text](https://...)" or a URL in brackets).
+_URL = re.compile(r"https?://(?:[^\s<>\"'()\[\]{}]|\([^\s<>\"'()\[\]{}]*\))+")
 
 
 def _norm_url(url: str) -> str:
@@ -349,14 +377,6 @@ def _added(session: DeckSession, index: int, slide: Any, extra: str = "") -> str
             f"The deck now has {len(session.deck.slides)} slides.{extra}")
 
 
-def _ensure_title_slide(session: DeckSession) -> None:
-    deck = session.deck
-    if deck.slides and isinstance(deck.slides[0], TitleSlide):
-        return
-    if deck.title and deck.title != Deck.model_fields["title"].default:
-        deck.slides.insert(0, TitleSlide(title=deck.title, subtitle=deck.subtitle, author=deck.author, date=deck.date))
-
-
 # --------------------------------------------------------------------------- registration
 def register_deck_tools(registry: ToolRegistry, session: DeckSession) -> None:
     @registry.add(
@@ -367,23 +387,27 @@ def register_deck_tools(registry: ToolRegistry, session: DeckSession) -> None:
     def set_deck_info(a: DeckInfoArgs) -> str:
         deck = session.deck
         deck.title, deck.subtitle, deck.author = a.title.strip(), a.subtitle.strip(), a.author.strip()
-        if a.theme:
-            deck.theme = a.theme
+        kept = ""
+        if a.theme and a.theme != deck.theme:
+            if session.theme_locked and not session.theme_requested:
+                kept = f" The user chose the {deck.theme} theme, so it was kept."
+            else:
+                deck.theme = a.theme
         deck.date = deck.date or date.today().strftime("%B %Y")
         title_slide = TitleSlide(title=deck.title, subtitle=deck.subtitle, author=deck.author, date=deck.date)
         if deck.slides and isinstance(deck.slides[0], TitleSlide):
-            title_slide.notes = deck.slides[0].notes
+            title_slide.notes, title_slide.sources = deck.slides[0].notes, deck.slides[0].sources
             deck.slides[0] = title_slide
             action = "Updated"
         else:
             deck.slides.insert(0, title_slide)
             action = "Created"
         session.dirty = True
-        return f"{action} title slide. Title: \"{deck.title}\", theme: {deck.theme}. Now add the content slides."
+        return (f"{action} title slide. Title: \"{deck.title}\", theme: {deck.theme}.{kept} "
+                "Now add the content slides.")
 
     @registry.add("add_bullet_slide", "Add a slide with a title and bullet points.", BulletArgs)
     def add_bullet_slide(a: BulletArgs) -> str:
-        _ensure_title_slide(session)
         slide = BulletSlide(title=a.title, bullets=a.bullets, notes=a.notes, sources=a.sources)
         extra = _bullet_warnings(slide.bullets) + _vet_sources(session, slide, [slide.title, *slide.bullets])
         return _added(session, session.insert(slide, a.position), slide, extra)
@@ -391,7 +415,6 @@ def register_deck_tools(registry: ToolRegistry, session: DeckSession) -> None:
     @registry.add("add_two_column_slide", "Add a slide comparing two things side by side (pros/cons, before/after, A vs B).",
                   TwoColumnArgs)
     def add_two_column_slide(a: TwoColumnArgs) -> str:
-        _ensure_title_slide(session)
         slide = TwoColumnSlide(title=a.title, left_heading=a.left_heading, left_bullets=a.left_bullets,
                                right_heading=a.right_heading, right_bullets=a.right_bullets,
                                notes=a.notes, sources=a.sources)
@@ -401,7 +424,6 @@ def register_deck_tools(registry: ToolRegistry, session: DeckSession) -> None:
     @registry.add("add_chart_slide",
                   "Add a native, editable chart. Use only real numbers from the user or from pages you read.", ChartArgs)
     def add_chart_slide(a: ChartArgs) -> str:
-        _ensure_title_slide(session)
         slide = ChartSlide(
             title=a.title, chart_type=a.chart_type, categories=a.categories,
             series=[ChartSeries(name=s.name, values=s.values) for s in a.series],
@@ -427,7 +449,6 @@ def register_deck_tools(registry: ToolRegistry, session: DeckSession) -> None:
 
     @registry.add("add_table_slide", "Add a slide with a table (structured comparisons, specs, timelines).", TableArgs)
     def add_table_slide(a: TableArgs) -> str:
-        _ensure_title_slide(session)
         slide = TableSlide(title=a.title, headers=a.headers, rows=a.rows, notes=a.notes, sources=a.sources)
         cells = [slide.title, *slide.headers, *(c for row in slide.rows for c in row)]
         return _added(session, session.insert(slide, a.position), slide, _vet_sources(session, slide, cells))
@@ -435,7 +456,6 @@ def register_deck_tools(registry: ToolRegistry, session: DeckSession) -> None:
     @registry.add("add_image_slide",
                   "Add a slide with an image (URL from search_images, or a local file) and optional bullets.", ImageArgs)
     def add_image_slide(a: ImageArgs) -> str:
-        _ensure_title_slide(session)
         from deck_agent.tools.web import save_image
 
         path = save_image(a.image, session.assets_dir, allow_private=session.allow_private_urls)
@@ -446,13 +466,11 @@ def register_deck_tools(registry: ToolRegistry, session: DeckSession) -> None:
 
     @registry.add("add_section_slide", "Add a section divider slide to separate parts of the talk.", SectionArgs)
     def add_section_slide(a: SectionArgs) -> str:
-        _ensure_title_slide(session)
         slide = SectionSlide(title=a.title, subtitle=a.subtitle, notes=a.notes)
         return _added(session, session.insert(slide, a.position), slide)
 
     @registry.add("add_quote_slide", "Add a slide with one large quote or key statement.", QuoteArgs)
     def add_quote_slide(a: QuoteArgs) -> str:
-        _ensure_title_slide(session)
         slide = QuoteSlide(quote=a.quote, attribution=a.attribution, notes=a.notes, sources=a.sources)
         extra = _vet_sources(session, slide, [slide.quote])
         if slide.attribution and not slide.sources:

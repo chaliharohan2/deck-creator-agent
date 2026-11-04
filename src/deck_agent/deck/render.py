@@ -49,6 +49,8 @@ def export_pdf(pptx_path: Path, timeout: int = 240) -> Path:
             "browser and use Print -> Save as PDF."
         )
     out_dir = pptx_path.parent
+    pdf = pptx_path.with_suffix(".pdf")
+    pdf.unlink(missing_ok=True)  # LibreOffice can fail with exit code 0; never return a stale PDF
     with tempfile.TemporaryDirectory(prefix="deck-agent-lo-") as profile:
         cmd = [
             soffice,
@@ -59,17 +61,22 @@ def export_pdf(pptx_path: Path, timeout: int = 240) -> Path:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
         except subprocess.TimeoutExpired as exc:
             raise PdfExportError(f"LibreOffice timed out after {timeout}s") from exc
-    pdf = pptx_path.with_suffix(".pdf")
     if proc.returncode != 0 or not pdf.exists():
         raise PdfExportError(f"LibreOffice failed (exit {proc.returncode}): {proc.stderr.strip()[:400]}")
     return pdf
 
 
 def safe_filename(name: str, default: str = "deck") -> str:
-    name = Path(name).name  # never allow directory traversal from model-chosen names
-    name = re.sub(r"\.(pptx|pdf|html|json)$", "", name, flags=re.I)
-    name = re.sub(r"[^\w\-. ]+", "", name).strip().replace(" ", "_")
-    return name[:80] or default
+    """A file name (without extension) from a deck title or a model-chosen name.
+
+    Path separators become word breaks ("Costs / Benefits" keeps both words) and "." / ".."
+    path parts are dropped, so the result can never point outside the output folder.
+    """
+    name = re.sub(r"(\.deck)?\.(pptx|pdf|html|json)$", "", name.strip(), flags=re.I)
+    parts = [p for p in re.split(r"[/\\]+", name) if p.strip() not in ("", ".", "..")]
+    name = re.sub(r"[^\w\-. ]+", "", " ".join(parts))
+    name = re.sub(r"\s+", "_", name.strip()).strip("._-")
+    return name[:80].rstrip("._-") or default
 
 
 def render_deck(deck: Deck, out_dir: str | Path, basename: str, formats: list[str] | tuple[str, ...] = ("pptx",)) -> dict[str, Path]:

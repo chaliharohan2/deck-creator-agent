@@ -1,6 +1,8 @@
 """Agent loop behaviour with a scripted fake model."""
 
-from deck_agent.agent import NUDGE, DeckAgent
+import pytest
+
+from deck_agent.agent import NUDGE, DeckAgent, mentions_theme
 from deck_agent.config import Settings
 from deck_agent.llm import LLMError, LLMResponse, ToolCall
 from deck_agent.tools import DeckSession, build_registry
@@ -165,3 +167,59 @@ def test_urls_in_user_message_count_as_sources(tmp_path):
     agent, _ = make_agent(tmp_path, script, web=False)
     agent.run("Use these notes. Source: https://ehpa.org/market-data/")
     assert agent.session.deck.slides[1].sources == ["https://ehpa.org/market-data/"]
+
+
+def test_unexpected_crash_still_saves_the_deck(tmp_path):
+    # e.g. a bug or an error the client did not anticipate: the run fails, but the work is on disk
+    script = [[("set_deck_info", {"title": "Saved"})],
+              [("add_bullet_slide", {"title": "a", "bullets": ["b", "c"]})],
+              RuntimeError("boom")]
+    agent, events = make_agent(tmp_path, script)
+    with pytest.raises(RuntimeError):
+        agent.run("x")
+    assert (tmp_path / "Saved.pptx").exists()
+    assert any(k == "autosave" for k, _ in events)
+
+
+def test_ctrl_c_saves_and_keeps_the_conversation_valid(tmp_path):
+    script = [[("set_deck_info", {"title": "Interrupted"}), ("add_bullet_slide", {"title": "a", "bullets": ["b", "c"]})],
+              "Continued."]
+    agent, _ = make_agent(tmp_path, script, interactive=True)
+    real_execute, calls = agent.registry.execute, []
+
+    def execute(name, args):
+        calls.append(name)
+        if len(calls) == 2:
+            raise KeyboardInterrupt  # pressed while the second tool call runs
+        return real_execute(name, args)
+
+    agent.registry.execute = execute
+    with pytest.raises(KeyboardInterrupt):
+        agent.run("build")
+    assert (tmp_path / "Interrupted.pptx").exists()  # the title slide built so far was saved
+    agent.registry.execute = real_execute
+    assert agent.run("go on").text == "Continued."
+    # every tool call has a result, or strict OpenAI-compatible servers reject the next request
+    called = [c["id"] for m in agent.messages if m["role"] == "assistant" for c in m.get("tool_calls") or []]
+    answered = [m["tool_call_id"] for m in agent.messages if m["role"] == "tool"]
+    assert called and sorted(called) == sorted(answered)
+    sent = agent.llm.calls[-1]
+    assert sent[-2]["role"] == "tool" and "interrupted" in sent[-2]["content"]
+
+
+def test_user_theme_is_kept_unless_the_request_asks_for_one(tmp_path):
+    settings = Settings(output_dir=tmp_path, web=False, theme="warm")
+    session = DeckSession(output_dir=tmp_path, default_theme="warm", theme_locked=True)
+    script = [[("set_deck_info", {"title": "T", "theme": "forest"})], "ok",
+              [("set_deck_info", {"title": "T", "theme": "dark"})], "ok"]
+    agent = DeckAgent(FakeLLM(script), build_registry(settings, session), session, settings, interactive=True)
+    agent.run("8 slides on heat pumps")
+    assert session.deck.theme == "warm"  # --theme warm beats the model's own pick
+    assert "chose the warm theme" in [m for m in agent.messages if m["role"] == "tool"][0]["content"]
+    agent.run("switch to the dark theme")
+    assert session.deck.theme == "dark"
+
+
+def test_mentions_theme():
+    assert mentions_theme("Use the DARK theme") and mentions_theme("make it minimal") and mentions_theme("change the theme")
+    assert not mentions_theme("10 slides on heat pumps") and not mentions_theme("highlight the darkest risks")

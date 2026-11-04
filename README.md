@@ -90,7 +90,7 @@ deck-agent themes      # light, dark, corporate, warm, forest, minimal
 deck-agent doctor      # checks model server, tool calling, web search, LibreOffice
 ```
 
-The formats you pass with `-f` are always produced (the model can add formats, not remove them).
+The formats you pass with `-f` are always produced (the model can add formats, not remove them). Likewise, the theme you pass with `-t` (or pick in the UI's theme menu) is kept unless your message asks for a different one.
 
 Common options: `-m/--model`, `-f/--formats pptx pdf html`, `-t/--theme`, `-o/--out-dir`, `--slides N`, `--no-web`, `--no-fact-check`, `--think`, `--num-ctx`, `-v/--verbose` (shows every tool result). Run `deck-agent run -h` for all options.
 
@@ -138,7 +138,7 @@ Every slide can carry **speaker notes** and **sources**. Sources appear in a foo
   * a cited URL the agent never saw is **removed** from the slide.
 
   This catches numbers and links that were made up outright, the common failure. It cannot prove a real number is used in the right context, so still review a deck before presenting it.
-* **Never lose work.** Old tool output is trimmed near the context limit, and an unsaved deck is always saved at the end.
+* **Never lose work.** Old tool output is trimmed near the context limit, and an unsaved deck is always saved at the end, also when the model server crashes or you press Ctrl+C.
 * **Thinking off by default.** Reasoning mode multiplies CPU time. Turn it on with `--think` on a GPU.
 
 ## Tested end to end
@@ -214,7 +214,7 @@ Details: [docs/LICENSES.md](docs/LICENSES.md).
 
 ```bash
 pip install -e ".[dev]"
-pytest            # ~100 tests; the agent loop and LLM clients use fakes/mocks, so no model is needed
+pytest            # ~175 tests; the agent loop and LLM clients use fakes/mocks, so no model is needed
 ruff check src tests
 ```
 

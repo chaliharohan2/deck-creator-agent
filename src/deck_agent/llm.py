@@ -109,6 +109,23 @@ class BaseLLM:
             "Is it running? For Ollama: `ollama serve` and `ollama pull " + self.model + "`."
         )
 
+    def _transport_error(self, exc: Exception) -> LLMError:
+        """Turn any failure while talking to the server into an LLMError.
+
+        The agent stops cleanly (and auto-saves) on LLMError; any other exception would
+        escape the loop and lose the deck built so far.
+        """
+        if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+            return self._connect_error(exc)
+        if isinstance(exc, httpx.TimeoutException):
+            return LLMError(f"The model did not answer within {self.timeout:.0f}s; try a smaller model or "
+                            "raise --timeout.")
+        if isinstance(exc, json.JSONDecodeError):
+            return LLMError(f"The {self.backend} server sent a malformed response ({exc.msg}). "
+                            "Check the server log; a proxy in between can also cause this.")
+        return LLMError(f"Lost the connection to the {self.backend} server at {self.base_url} "
+                        f"({exc.__class__.__name__}: {exc}). It may have crashed or run out of memory.")
+
 
 class OllamaLLM(BaseLLM):
     """Ollama native API (``POST /api/chat``) with streaming."""
@@ -183,11 +200,8 @@ class OllamaLLM(BaseLLM):
                     if chunk.get("done"):
                         prompt_tokens = chunk.get("prompt_eval_count") or 0
                         completion_tokens = chunk.get("eval_count") or 0
-        except httpx.ConnectError as exc:
-            raise self._connect_error(exc) from exc
-        except httpx.ReadTimeout as exc:
-            raise LLMError(f"The model did not answer within {self.timeout:.0f}s; try a smaller model or "
-                           "raise --timeout.") from exc
+        except (httpx.HTTPError, json.JSONDecodeError) as exc:
+            raise self._transport_error(exc) from exc
         calls = []
         for rc in raw_calls:
             fn = rc.get("function") or {}
@@ -204,6 +218,7 @@ class OllamaLLM(BaseLLM):
             text = json.loads(body).get("error", body)
         except (json.JSONDecodeError, AttributeError):
             pass
+        text = str(text)
         if "not found" in text and "model" in text:
             return f"Model '{self.model}' is not installed in Ollama. Run: ollama pull {self.model}"
         if "does not support tools" in text:
@@ -215,9 +230,9 @@ class OllamaLLM(BaseLLM):
         try:
             r = self._http.get(f"{self.base_url}/api/tags")
             r.raise_for_status()
-        except httpx.ConnectError as exc:
-            raise self._connect_error(exc) from exc
-        return [m["name"] for m in r.json().get("models", [])]
+            return [m["name"] for m in r.json().get("models", [])]
+        except (httpx.HTTPError, json.JSONDecodeError) as exc:
+            raise self._transport_error(exc) from exc
 
     def capabilities(self) -> list[str]:
         r = self._http.post(f"{self.base_url}/api/show", json={"model": self.model})
@@ -278,10 +293,8 @@ class OpenAICompatLLM(BaseLLM):
                 if "text/event-stream" not in r.headers.get("content-type", ""):
                     return self._parse_full(json.loads(r.read()), known)
                 return self._parse_stream(r, known, on_progress)
-        except httpx.ConnectError as exc:
-            raise self._connect_error(exc) from exc
-        except httpx.ReadTimeout as exc:
-            raise LLMError(f"The model did not answer within {self.timeout:.0f}s.") from exc
+        except (httpx.HTTPError, json.JSONDecodeError) as exc:
+            raise self._transport_error(exc) from exc
 
     def _parse_stream(self, r: httpx.Response, known: set[str], on_progress) -> LLMResponse:
         content, reasoning = [], []
@@ -312,10 +325,10 @@ class OpenAICompatLLM(BaseLLM):
                     if on_progress:
                         on_progress(n, "writing")
                 for tc in delta.get("tool_calls") or []:
-                    slot = acc.setdefault(tc.get("index", len(acc)), {"id": "", "name": "", "arguments": ""})
+                    fn = tc.get("function") or {}
+                    slot = acc.setdefault(_delta_index(tc, fn, acc), {"id": "", "name": "", "arguments": ""})
                     if tc.get("id"):
                         slot["id"] = tc["id"]
-                    fn = tc.get("function") or {}
                     if fn.get("name") and not slot["name"]:
                         slot["name"] = fn["name"]
                     args = fn.get("arguments")
@@ -357,9 +370,27 @@ class OpenAICompatLLM(BaseLLM):
         try:
             r = self._http.get(self._url("/models"))
             r.raise_for_status()
-        except httpx.ConnectError as exc:
-            raise self._connect_error(exc) from exc
-        return [m.get("id", "") for m in r.json().get("data", [])]
+            return [m.get("id", "") for m in r.json().get("data", [])]
+        except (httpx.HTTPError, json.JSONDecodeError) as exc:
+            raise self._transport_error(exc) from exc
+
+
+def _delta_index(tc: dict[str, Any], fn: dict[str, Any], acc: dict[int, dict[str, str]]) -> int:
+    """Which tool call a streamed delta belongs to.
+
+    Servers normally send ``index``. Some omit it; then a delta that carries a known id
+    continues that call, a delta with no id and no name continues the last call, and
+    anything else starts a new one.
+    """
+    if isinstance(tc.get("index"), int):
+        return tc["index"]
+    call_id = tc.get("id")
+    for k, slot in acc.items():
+        if call_id and slot["id"] == call_id:
+            return k
+    if acc and not call_id and not fn.get("name"):
+        return max(acc)
+    return max(acc) + 1 if acc else 0
 
 
 DEFAULT_BASE_URLS = {"ollama": "http://localhost:11434", "openai": "http://localhost:8080/v1"}

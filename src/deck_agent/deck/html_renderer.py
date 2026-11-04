@@ -9,9 +9,12 @@ per page.
 from __future__ import annotations
 
 import base64
+import io
 import mimetypes
 from html import escape
 from pathlib import Path
+
+from PIL import Image
 
 from deck_agent.deck.model import (
     BulletSlide,
@@ -27,7 +30,16 @@ from deck_agent.deck.model import (
     bullet_level,
 )
 from deck_agent.deck.svg_charts import render_svg_chart
-from deck_agent.deck.text import fit_font_size, mix, parse_inline, short_source, sources_line
+from deck_agent.deck.text import (
+    fit_font_size,
+    fit_table,
+    is_numeric,
+    mix,
+    parse_inline,
+    short_source,
+    sources_line,
+    table_column_weights,
+)
 from deck_agent.deck.themes import Theme, get_theme
 
 PX_PER_IN = 96
@@ -63,8 +75,15 @@ def _bullets_html(items: list[str], width_px: float, height_px: float, max_size:
 
 
 def _data_uri(path: Path) -> str:
+    """The image as a data: URI. Raises OSError if the file is missing or is not a readable image."""
+    data = path.read_bytes()
+    try:
+        with Image.open(io.BytesIO(data)) as probe:
+            probe.verify()
+    except Exception as exc:  # noqa: BLE001 - Pillow raises various errors for corrupt files
+        raise OSError(f"not a readable image: {path}") from exc
     mime = mimetypes.guess_type(path.name)[0] or "image/png"
-    return f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode()}"
+    return f"data:{mime};base64,{base64.b64encode(data).decode()}"
 
 
 class HtmlRenderer:
@@ -169,21 +188,31 @@ class HtmlRenderer:
         return self._head(s.title) + f'<div class="body chart-row">{svg}{side}</div>'
 
     def _slide_table(self, s: TableSlide) -> str:
-        n = len(s.rows)
-        size = 18 if n <= 4 else 16 if n <= 7 else 14 if n <= 10 else 12
-        head = "".join(f"<th>{_inline(h)}</th>" for h in s.headers)
-        rows = "".join("<tr>" + "".join(f"<td>{_inline(c)}</td>" for c in row) + "</tr>" for row in s.rows)
+        n_rows, n_cols = len(s.rows) + 1, len(s.headers)
+        weights = table_column_weights(s.headers, s.rows)
+        width_in, height_in = 1164 / PX_PER_IN, 450 / PX_PER_IN  # the slide's content box
+        start = 18 if n_rows <= 5 and n_cols <= 4 else 16 if n_rows <= 8 else 14 if n_rows <= 10 else 12
+        size, _ = fit_table(s.headers, s.rows, [width_in * w / sum(weights) for w in weights], height_in,
+                            max_size=start if n_cols < 6 else min(start, 13), cell_pad_x_in=0.3, cell_pad_y_in=0.2)
+        numeric = [all(is_numeric(row[c]) or not row[c] for row in s.rows) and any(row[c] for row in s.rows)
+                   for c in range(n_cols)]
+        cls = [' class="num"' if numeric[c] else "" for c in range(n_cols)]
+        cols = "".join(f'<col style="width:{100 * w / sum(weights):.2f}%">' for w in weights)
+        head = "".join(f"<th{cls[c]}>{_inline(h)}</th>" for c, h in enumerate(s.headers))
+        rows = "".join("<tr>" + "".join(f"<td{cls[c]}>{_inline(x)}</td>" for c, x in enumerate(row)) + "</tr>"
+                       for row in s.rows)
         return self._head(s.title) + (
-            f'<div class="body"><table style="font-size:{_pt(size)}"><thead><tr>{head}</tr></thead>'
-            f"<tbody>{rows}</tbody></table></div>"
+            f'<div class="body"><table style="font-size:{_pt(size)}"><colgroup>{cols}</colgroup>'
+            f"<thead><tr>{head}</tr></thead><tbody>{rows}</tbody></table></div>"
         )
 
     def _slide_image(self, s: ImageSlide) -> str:
         path = Path(s.image_path)
-        if path.exists():
+        try:
             img = f'<img src="{_data_uri(path)}" alt="{escape(s.caption or s.title)}">'
-        else:
-            img = f'<div class="missing">[missing image: {escape(path.name)}]</div>'
+        except OSError:  # missing or unreadable file, same placeholder text as the PPTX
+            label = "missing image" if not path.exists() else "unreadable image"
+            img = f'<div class="missing">[{label}: {escape(path.name)}]</div>'
         cap = f"<figcaption>{_inline(s.caption)}</figcaption>" if s.caption else ""
         fig = f"<figure>{img}{cap}</figure>"
         if s.bullets:
@@ -258,9 +287,10 @@ ul.sub li {{ margin-top: .25em; }}
 .chart-row .side {{ flex: 1; }}
 .chart-row .side h3 {{ font-size: 21px; }}
 svg.chart {{ font-family: inherit; flex: none; }}
-table {{ width: 100%; border-collapse: collapse; }}
+table {{ width: 100%; border-collapse: collapse; table-layout: fixed; overflow-wrap: anywhere; }}
 th {{ background: #{accent}; color: #{accent_text}; text-align: left; padding: 10px 14px; }}
 td {{ padding: 9px 14px; }}
+th.num, td.num {{ text-align: right; }}
 tbody tr:nth-child(odd) td {{ background: #{bg}; }}
 tbody tr:nth-child(even) td {{ background: #{surface}; }}
 figure {{ margin: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
@@ -309,6 +339,8 @@ _JS = """
     slides.forEach((el, k) => el.classList.toggle('active', k === i));
     document.getElementById('counter').textContent = (i + 1) + ' / ' + slides.length;
     history.replaceState(null, '', '#' + (i + 1));
+    // replaceState fires no hashchange; tell an embedding page (the deck-agent UI) which slide shows.
+    window.dispatchEvent(new CustomEvent('slidechange', { detail: i + 1 }));
   }
   document.addEventListener('keydown', e => {
     if (['ArrowRight', 'ArrowDown', 'PageDown', ' ', 'Enter'].includes(e.key)) { show(i + 1); e.preventDefault(); }

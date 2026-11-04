@@ -10,6 +10,8 @@ from deck_agent.deck.model import (
     TitleSlide,
     normalize_bullets,
     parse_number,
+    parse_values,
+    string_list,
 )
 
 
@@ -99,3 +101,39 @@ def test_deck_json_roundtrip(tmp_path):
     assert loaded == deck
     assert loaded.slides[1].sources == ["https://a.b"]
     assert "2. [bullets] B" in loaded.outline()
+
+
+@pytest.mark.parametrize("bad", ["nan", "inf", "-Infinity", float("nan"), float("inf")])
+def test_parse_number_rejects_non_finite(bad):
+    with pytest.raises(ValueError, match="finite"):
+        parse_number(bad)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("1,234", [1234.0]),                 # thousands separator, one value
+        ("1, 2, 3", [1.0, 2.0, 3.0]),        # used to become [123.0]
+        ("1,2,3", [1.0, 2.0, 3.0]),
+        ("1,234, 5,678", [1234.0, 5678.0]),
+        ("1;2;3;", [1.0, 2.0, 3.0]),
+        ("12.5\n13", [12.5, 13.0]),
+        (["1", "", "3"], [1.0, 0.0, 3.0]),   # an explicit gap stays a gap
+        ("−5", [-5.0]),                 # Unicode minus sign
+        (7, [7.0]),
+    ],
+)
+def test_parse_values(raw, expected):
+    assert parse_values(raw) == expected
+
+
+def test_series_as_list_of_name_value_objects():
+    c = ChartSlide(title="t", categories=["a", "b"], series=[{"Revenue": [1, 2]}, {"Cost": "3, 4"}])
+    assert [(s.name, s.values) for s in c.series] == [("Revenue", [1.0, 2.0]), ("Cost", [3.0, 4.0])]
+
+
+def test_string_list():
+    assert string_list("https://a.com, https://b.com") == ["https://a.com", "https://b.com"]
+    assert string_list(["EHPA 2025 report", "https://a.com;https://b.com"]) == [
+        "EHPA 2025 report", "https://a.com", "https://b.com"]
+    assert string_list("Smith, J. (2024)") == ["Smith, J. (2024)"]  # a plain citation keeps its commas

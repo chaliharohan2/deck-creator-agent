@@ -238,7 +238,8 @@ function showPage() {
 }
 
 async function showPdf() {
-  if (!ui.deck.count) { els.pages.hidden = true; return; }
+  els.pages.hidden = !ui.deck.count;  // hidden for an empty deck, shown again once slides exist
+  if (!ui.deck.count) return;
   if (ui.pagesVersion === ui.deck.version) { showPage(); return; }
   els.overlay.hidden = false;
   els.overlayText.textContent = "Rendering the PowerPoint file with LibreOffice…";
@@ -275,6 +276,7 @@ els.frame.addEventListener("load", () => {
     const w = els.frame.contentWindow;
     const sync = () => { const n = parseInt(w.location.hash.slice(1), 10); if (n) setCurrent(n); };
     w.addEventListener("hashchange", sync);
+    w.addEventListener("slidechange", sync);  // clicks and arrow keys inside the preview
     sync();
   } catch { /* cross-origin (should not happen) */ }
 });
@@ -294,7 +296,11 @@ function handle(ev) {
     case "user": {
       const files = (ev.attachments || []).map((n) => `<span>📎 ${escapeHtml(n)}</span>`).join("");
       addBubble("user", escapeHtml(ev.text || "(see attached notes)") + (files ? `<div class="files">${files}</div>` : ""));
-      if (ev.truncated) addNote("Attachments were long and have been shortened to fit the model's context window.");
+      if (ev.omitted && ev.omitted.length) {
+        addNote(`Left out to fit the model's context window: ${ev.omitted.join(", ")}. Send them in a later message.`);
+      } else if (ev.truncated) {
+        addNote("Attachments were long and have been shortened to fit the model's context window.");
+      }
       startTurn();
       break;
     }
@@ -356,6 +362,7 @@ function applySettings(s) {
   if (s.model) {
     if (![...els.model.options].some((o) => o.value === s.model)) els.model.add(new Option(s.model, s.model));
     els.model.value = s.model;
+    els.model.dataset.prev = s.model;
   }
   els.web.checked = !!s.web;
   els.factcheck.checked = !!s.verify_numbers;
@@ -368,8 +375,8 @@ async function changeSetting(body, revert) {
 
 els.model.addEventListener("change", () => {
   const prev = els.model.dataset.prev;
-  changeSetting({ model: els.model.value }, () => { els.model.value = prev; });
   els.model.dataset.prev = els.model.value;
+  changeSetting({ model: els.model.value }, () => { els.model.value = prev; els.model.dataset.prev = prev; });
 });
 els.web.addEventListener("change", () => changeSetting({ web: els.web.checked }, () => { els.web.checked = !els.web.checked; }));
 els.factcheck.addEventListener("change", () =>

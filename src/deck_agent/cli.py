@@ -132,6 +132,12 @@ class ConsoleReporter:
         self.status = None
         self.t0 = 0.0
 
+    def stop(self) -> None:
+        """Stop the live status line (e.g. after Ctrl+C) so it does not draw over the prompt."""
+        if self.status:
+            self.status.stop()
+            self.status = None
+
     def __call__(self, kind: str, data: dict[str, Any]) -> None:
         if kind == "llm_start":
             self.t0 = time.time()
@@ -141,9 +147,7 @@ class ConsoleReporter:
             verb = "thinking" if data["phase"] == "thinking" else "writing"
             self.status.update(f"[cyan]Model {verb}… {data['tokens']} tokens, {time.time() - self.t0:.0f}s")
         elif kind in ("llm_end", "llm_error"):
-            if self.status:
-                self.status.stop()
-                self.status = None
+            self.stop()
             if kind == "llm_error":
                 console.print(f"[red]✗ {escape(data['error'])}")
             elif self.verbose:
@@ -189,7 +193,8 @@ def _build_agent(s: Settings, interactive: bool, verbose: bool):
     from deck_agent.tools import DeckSession, build_registry
 
     session = DeckSession(output_dir=s.output_dir, formats=s.formats, default_theme=s.theme,
-                          allow_private_urls=s.allow_private_urls, verify_numbers=s.verify_numbers)
+                          theme_locked=bool(s.theme), allow_private_urls=s.allow_private_urls,
+                          verify_numbers=s.verify_numbers)
     registry = build_registry(s, session)
     llm = _make_llm(s)
     agent = DeckAgent(llm, registry, session, s, interactive=interactive, on_event=ConsoleReporter(verbose))
@@ -221,7 +226,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     _header(s)
     agent = _build_agent(s, interactive=False, verbose=args.verbose)
     t0 = time.time()
-    result = agent.run(request)
+    try:
+        result = agent.run(request)  # on Ctrl+C the deck built so far is auto-saved before this raises
+    except BaseException:
+        agent.on_event.stop()
+        _print_files(agent.session.saved)
+        agent.llm.close()
+        raise
     console.print()
     if result.text:
         console.print(Panel(escape(result.text), title="Agent", border_style="cyan"))
@@ -229,7 +240,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     console.print(f"[dim]{len(agent.session.deck.slides)} slides · {result.steps} model turns · "
                   f"{result.tool_calls} tool calls ({result.errors} corrected) · {time.time() - t0:.0f}s[/]")
     agent.llm.close()
-    return 0 if result.files else 1
+    # A model failure is a failed run even though the partial deck was saved (scripts check this).
+    return 0 if result.files and result.stopped_reason != "llm_error" else 1
 
 
 CHAT_HELP = """Commands: /slides (outline) · /save [pptx pdf html] · /new (start over) · /help · /quit
@@ -278,6 +290,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
         try:
             result = agent.run(line)
         except KeyboardInterrupt:
+            agent.on_event.stop()
             console.print("[yellow]Interrupted.[/]")
             continue
         if result.text:
@@ -287,15 +300,32 @@ def cmd_chat(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_deck(path: Path) -> Deck | None:
+    """Load a .deck.json, printing a readable error instead of a traceback."""
+    try:
+        return Deck.load_json(path)
+    except FileNotFoundError:
+        console.print(f"[red]No such file: {escape(str(path))}")
+    except OSError as exc:
+        console.print(f"[red]Cannot read {escape(str(path))}: {escape(str(exc))}")
+    except ValueError as exc:  # invalid JSON, non-UTF-8 text, or a spec that fails validation
+        console.print(f"[red]{escape(str(path))} is not a valid deck spec:[/]\n{escape(str(exc)[:1500])}")
+    return None
+
+
 def cmd_ui(args: argparse.Namespace) -> int:
     from deck_agent.web import serve
 
+    if args.deck and _load_deck(args.deck) is None:
+        return 1
     serve(settings_from_args(args), host=args.host, port=args.port, open_browser=args.open, deck_path=args.deck)
     return 0
 
 
 def cmd_render(args: argparse.Namespace) -> int:
-    deck = Deck.load_json(args.spec)
+    deck = _load_deck(args.spec)
+    if deck is None:
+        return 1
     if args.theme:
         deck.theme = args.theme
     out_dir = args.out_dir or args.spec.parent
@@ -368,7 +398,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         try:
             from deck_agent.tools.web import make_search_backend
 
-            backend = make_search_backend(s.search_backend, searxng_url=s.searxng_url, region=s.search_region)
+            backend = make_search_backend(s.search_backend, searxng_url=s.searxng_url, region=s.search_region,
+                                          image_license=s.image_license, wikipedia_fallback=s.wikipedia_fallback)
             res = backend.text("python programming language", 2)
             rows.append(("web search", bool(res), f"{s.search_backend}: {len(res)} results"))
         except Exception as exc:  # noqa: BLE001
