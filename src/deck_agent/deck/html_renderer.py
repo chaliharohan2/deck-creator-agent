@@ -75,6 +75,10 @@ class HtmlRenderer:
     def render(self, path: str | Path) -> Path:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(self.to_html(), encoding="utf-8")
+        return path
+
+    def to_html(self) -> str:
         total = len(self.deck.slides)
         sections = []
         for i, slide in enumerate(self.deck.slides, 1):
@@ -93,8 +97,7 @@ class HtmlRenderer:
             slides="\n".join(sections),
             js=_JS,
         )
-        path.write_text(html, encoding="utf-8")
-        return path
+        return html
 
     # ------------------------------------------------------------------ pieces
     def _css(self) -> str:

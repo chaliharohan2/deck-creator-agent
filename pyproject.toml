@@ -24,6 +24,8 @@ dependencies = [
     "pypdf>=4.0",           # BSD-3    - text extraction when a search result is a PDF
     "Pillow>=10.0",         # MIT-CMU  - image validation/conversion
     "rich>=13.0",           # MIT      - terminal UI
+    "starlette>=0.37",      # BSD-3    - web UI server
+    "uvicorn>=0.30",        # BSD-3    - ASGI server for the web UI
 ]
 
 [project.optional-dependencies]
@@ -35,8 +37,12 @@ deck-agent = "deck_agent.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+deck_agent = ["web/static/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+filterwarnings = ["ignore:Using `httpx` with `starlette.testclient`"]
 
 [tool.ruff]
 line-length = 110
