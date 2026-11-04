@@ -90,7 +90,8 @@ class ToolArgs(BaseModel):
                         pass
                 if isinstance(value, str):
                     if key in _COMMA_LIST_FIELDS and "\n" not in text:
-                        value = [p.strip() for p in text.split(",") if p.strip()]
+                        sep = "|" if "|" in text else ","  # "Country | Cost" as well as "Country, Cost"
+                        value = [p.strip() for p in text.strip(sep).split(sep) if p.strip()]
                     elif text:
                         value = [line for line in text.splitlines() if line.strip()]
                     else:
@@ -106,6 +107,10 @@ class ToolArgs(BaseModel):
                     from deck_agent.deck.model import normalize_bullets
 
                     value = normalize_bullets(value)
+                elif key == "sources" and isinstance(value, list):  # "url1, url2" is two sources
+                    from deck_agent.deck.model import string_list
+
+                    value = string_list(value)
                 value = _stringify(field.annotation, value)
             out[key] = value
         return out

@@ -89,6 +89,52 @@ def fit_font_size(
     return sizes[-1]
 
 
+def is_numeric(text: str) -> bool:
+    """A table cell holding a plain number ("1,200", "-3.5%", "$40"): aligned right."""
+    cleaned = re.sub(r"[,%$€£¥₹\s]", "", text).lstrip("+-\u2212")
+    if not any(ch.isdigit() for ch in cleaned):  # "nan", "inf", "Infinity" are words here
+        return False
+    try:
+        float(cleaned)
+        return True
+    except ValueError:
+        return False
+
+
+def table_column_weights(headers: list[str], rows: list[list[str]]) -> list[int]:
+    """Relative column widths: proportional to the longest text in each column (clamped)."""
+    return [min(max(max(len(plain(row[c])) for row in [headers, *rows]), 6), 40) for c in range(len(headers))]
+
+
+def fit_table(
+    headers: list[str],
+    rows: list[list[str]],
+    col_widths_in: list[float],
+    height_in: float,
+    max_size: int = 18,
+    cell_pad_x_in: float = 0.24,
+    cell_pad_y_in: float = 0.1,
+    min_size: int = 10,
+) -> tuple[int, list[float]]:
+    """Largest font size (<= ``max_size``) at which the table fits ``height_in``, and its row heights.
+
+    Rows get a roomy height when there is space and shrink to their text otherwise; cells that
+    wrap are counted with :func:`estimate_lines`.
+    """
+    heights: list[float] = []
+    for size in range(max_size, min_size - 1, -1):
+        text_h = [
+            max(estimate_lines(cell, w, size, indent_in=cell_pad_x_in) for cell, w in zip(row, col_widths_in, strict=True))
+            * size * 1.2 / 72 + cell_pad_y_in
+            for row in [headers, *rows]
+        ]
+        roomy = max(0.42, size * 2.1 / 72)
+        for heights in ([max(roomy, h) for h in text_h], text_h):
+            if sum(heights) <= height_in:
+                return size, heights
+    return min_size, heights
+
+
 def mix(c1: str, c2: str, t: float) -> str:
     """Blend two hex colours: t=0 -> c1, t=1 -> c2."""
     a = [int(c1[i : i + 2], 16) for i in (0, 2, 4)]

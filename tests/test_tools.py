@@ -358,3 +358,113 @@ def test_duplicate_slides_are_refused(setup):
     r = registry.execute("add_bullet_slide", {"title": "Recommendations", "bullets": ["a", "b"]})
     assert not r.ok and "already has this content" in r.content
     assert registry.execute("add_section_slide", {"title": "Next steps"}).ok  # different kind is fine
+
+
+def test_chart_values_sent_as_one_string(setup):
+    registry, session, _ = setup
+    session.verify_numbers = False
+    r = registry.execute("add_chart_slide", {"title": "c", "categories": "a, b, c",
+                                             "series": [{"name": "s", "values": "1, 2, 3"}]})
+    assert r.ok, r.content  # used to become the single value 123
+    assert session.deck.slides[-1].series[0].values == [1.0, 2.0, 3.0]
+
+
+@pytest.mark.parametrize("rows", [
+    [{"Country": "DE", "Cost": "30k"}, {"Country": "FR", "Cost": None}],  # rows as objects, empty cell
+    ["DE | 30k", "FR | "],                                                # rows as "a | b" strings
+    "| DE | 30k |\n|---|---|\n| FR | |",                                  # one markdown table
+    [["DE", 30], ["FR", None]],
+])
+def test_table_rows_in_the_shapes_models_send(setup, rows):
+    registry, session, _ = setup
+    r = registry.execute("add_table_slide", {"title": "Costs", "headers": "Country | Cost", "rows": rows})
+    assert r.ok, r.content
+    table = session.deck.slides[-1]
+    assert table.headers == ["Country", "Cost"]
+    assert [row[0] for row in table.rows] == ["DE", "FR"] and table.rows[1][1] == ""
+
+
+def test_sources_sent_as_one_string(setup):
+    registry, session, _ = setup
+    session.note_urls("https://a.com/x and https://b.com/y")
+    for sources in ("https://a.com/x, https://b.com/y", "https://a.com/x; https://b.com/y"):
+        registry.execute("add_bullet_slide", {"title": sources, "bullets": ["x", "y"], "sources": sources})
+        assert session.deck.slides[-1].sources == ["https://a.com/x", "https://b.com/y"]
+
+
+def test_urls_with_parentheses_are_recognised(setup):
+    registry, session, _ = setup
+    session.note_source("URL: https://en.wikipedia.org/wiki/Mercury_(planet)\nsee [the report](https://x.org/r)")
+    r = registry.execute("add_bullet_slide", {"title": "a", "bullets": ["x", "y"], "sources": [
+        "https://en.wikipedia.org/wiki/Mercury_(planet)", "https://x.org/r"]})
+    assert "Removed" not in r.content
+    assert session.deck.slides[-1].sources == ["https://en.wikipedia.org/wiki/Mercury_(planet)", "https://x.org/r"]
+
+
+def test_title_slide_is_not_resurrected(setup):
+    registry, session, _ = setup
+    kinds = lambda: [s.kind for s in session.deck.slides]  # noqa: E731
+    registry.execute("set_deck_info", {"title": "Deck"})
+    registry.execute("add_bullet_slide", {"title": "A", "bullets": ["x", "y"]})
+    registry.execute("delete_slide", {"slide_number": 1})  # the user removed it on purpose
+    registry.execute("add_bullet_slide", {"title": "B", "bullets": ["p", "q"]})
+    assert kinds() == ["bullets", "bullets"]
+    registry.execute("set_deck_info", {"title": "Deck"})
+    registry.execute("move_slide", {"slide_number": 1, "new_position": 3})  # title moved to the end
+    r = registry.execute("add_bullet_slide", {"title": "A", "bullets": ["x", "y"]})  # refused: duplicate
+    assert not r.ok and kinds() == ["bullets", "bullets", "title"]  # no second title slide
+
+
+def test_starting_over_reopens_with_the_title_slide(setup):
+    registry, session, _ = setup
+    registry.execute("set_deck_info", {"title": "Deck"})
+    registry.execute("delete_slide", {"slide_number": 1})
+    r = registry.execute("add_bullet_slide", {"title": "A", "bullets": ["x", "y"], "position": 1})
+    assert [s.kind for s in session.deck.slides] == ["title", "bullets"] and "Added slide 2" in r.content
+
+
+def test_reset_forgets_the_old_conversation(tmp_path):
+    session = DeckSession(output_dir=tmp_path, default_theme="dark", theme_locked=True)
+    session.note_source("https://old.example/report says 4,321 units")
+    session.theme_locked = False
+    session.deck.theme = "warm"
+    session.reset()
+    assert not session.known_urls and not len(session.facts)
+    assert session.deck.theme == "dark" and session.theme_locked
+
+
+def test_formats_are_normalised(tmp_path):
+    session = DeckSession(output_dir=tmp_path, formats=["PPTX", "html "])
+    session.deck.slides.append(BulletSlide(title="t", bullets=["b"]))
+    paths, _ = session.save(formats=["pptx", ".html"])
+    assert set(paths) == {"json", "pptx", "html"}
+
+
+def test_fallback_on_any_primary_failure():
+    class Crashes(FakeSearch):
+        def text(self, q, n):
+            raise OSError("network unreachable")
+
+    assert len(FallbackBackend(Crashes(), FakeSearch()).text("q", 2)) == 2
+    with pytest.raises(ToolError, match="OSError"):
+        FallbackBackend(Crashes(), EmptySearch()).text("q", 2)
+
+
+def test_searxng_http_errors_are_tool_errors(monkeypatch):
+    from deck_agent.tools.web import SearxngBackend
+
+    real_client = httpx.Client
+    monkeypatch.setattr(httpx, "Client", lambda **kw: real_client(
+        transport=httpx.MockTransport(lambda r: httpx.Response(502, text="bad gateway")), **kw))
+    with pytest.raises(ToolError, match="HTTP 502"):
+        SearxngBackend("http://searx").text("q", 3)
+    assert FallbackBackend(SearxngBackend("http://searx"), FakeSearch()).text("q", 1)  # so the fallback runs
+
+
+def test_page_charset_is_honoured():
+    body = "<p>Le coût moyen est de 30 000 € pour une pompe à chaleur. </p>" * 10
+    page = f"<html><head><title>Société</title></head><body><article>{body}</article></body></html>"
+    title, text = extract_page_text(page.encode("cp1252"), "text/html; charset=windows-1252", "u")
+    assert title == "Société" and "30 000 €" in text
+    meta = page.replace("<head>", '<head><meta charset="iso-8859-15">')
+    assert extract_page_text(meta.encode("iso-8859-15"), "text/html", "u")[0] == "Société"

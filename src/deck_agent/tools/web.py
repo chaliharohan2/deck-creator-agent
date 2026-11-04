@@ -143,6 +143,8 @@ class DDGSBackend:
             if "No results" in str(exc):
                 return []
             raise ToolError(f"search failed ({exc}); try again with a different query") from exc
+        except Exception as exc:  # noqa: BLE001 - network/library errors: let the fallback take over
+            raise ToolError(f"search failed ({exc.__class__.__name__}); try again with a different query") from exc
         return [{"title": r.get("title", ""), "url": r.get("href", ""), "snippet": r.get("body", "")} for r in rows]
 
     def images(self, query: str, max_results: int) -> list[dict[str, Any]]:
@@ -155,6 +157,8 @@ class DDGSBackend:
             if "No results" in str(exc):
                 return []
             raise ToolError(f"image search failed ({exc})") from exc
+        except Exception as exc:  # noqa: BLE001
+            raise ToolError(f"image search failed ({exc.__class__.__name__})") from exc
         return [
             {"title": r.get("title", ""), "image_url": r.get("image", ""), "page_url": r.get("url", ""),
              "width": r.get("width"), "height": r.get("height"), "source": r.get("source", ""),
@@ -180,8 +184,12 @@ class SearxngBackend:
             raise ToolError(f"SearXNG at {self.base_url} is not reachable ({exc.__class__.__name__})") from exc
         if r.status_code == 403:
             raise ToolError("SearXNG refused JSON output: add `json` to `search.formats` in settings.yml")
-        r.raise_for_status()
-        return r.json().get("results", [])
+        if r.status_code != 200:
+            raise ToolError(f"SearXNG search failed (HTTP {r.status_code})")
+        try:
+            return r.json().get("results", [])
+        except ValueError as exc:
+            raise ToolError("SearXNG sent an invalid response") from exc
 
     def text(self, query: str, max_results: int) -> list[dict[str, str]]:
         rows = self._search({"q": query, "safesearch": 1})[:max_results]
@@ -219,7 +227,10 @@ class WikipediaBackend:
             raise ToolError(f"Wikipedia search failed ({exc.__class__.__name__})") from exc
         if r.status_code != 200:
             raise ToolError(f"Wikipedia search failed (HTTP {r.status_code})")
-        rows = r.json().get("query", {}).get("search", [])
+        try:
+            rows = r.json().get("query", {}).get("search", [])
+        except ValueError as exc:
+            raise ToolError("Wikipedia sent an invalid response") from exc
         return [
             {"title": f"{row['title']} - Wikipedia",
              "url": f"https://{self.lang}.wikipedia.org/wiki/{quote(row['title'].replace(' ', '_'))}",
@@ -248,6 +259,8 @@ class FallbackBackend:
             primary_error = None
         except ToolError as exc:
             rows, primary_error = [], exc
+        except Exception as exc:  # noqa: BLE001 - any failure of the primary is what the fallback is for
+            rows, primary_error = [], ToolError(f"search failed ({exc.__class__.__name__})")
         if rows:
             return rows
         try:
@@ -293,6 +306,20 @@ def _html_title(html: str) -> str:
     return re.sub(r"\s+", " ", m.group(1)).strip()[:200] if m else ""
 
 
+_CHARSET = re.compile(rb"""<meta[^>]+charset\s*=\s*["']?([\w.:-]+)""", re.I)
+
+
+def _decode(data: bytes, content_type: str) -> str:
+    """Decode a page with the charset from the Content-Type header or a <meta> tag (UTF-8 otherwise)."""
+    m = re.search(r"charset\s*=\s*[\"']?([\w.:-]+)", content_type, re.I)
+    meta = None if m else _CHARSET.search(data[:4096])
+    charset = m.group(1) if m else meta.group(1).decode("ascii") if meta else "utf-8"
+    try:
+        return data.decode(charset, errors="replace")
+    except LookupError:  # unknown charset name
+        return data.decode("utf-8", errors="replace")
+
+
 def extract_page_text(data: bytes, content_type: str, url: str) -> tuple[str, str]:
     """Return ``(title, text)`` for an HTML/PDF/text payload."""
     ctype = content_type.lower()
@@ -309,7 +336,7 @@ def extract_page_text(data: bytes, content_type: str, url: str) -> tuple[str, st
     text_types = ("html", "xml", "text/plain", "json", "markdown")
     if ctype and not any(t in ctype for t in text_types):
         raise ToolError(f"unsupported content type {content_type!r}")
-    html = data.decode("utf-8", errors="replace")
+    html = _decode(data, content_type)
     if "text/plain" in ctype or "markdown" in ctype or "json" in ctype:
         return "", html.strip()
     import trafilatura

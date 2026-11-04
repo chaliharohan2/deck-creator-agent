@@ -98,15 +98,16 @@ def _cartesian(s: ChartSlide, theme: Theme, W: int, H: int) -> str:
         frac = (v - lo) / span
         return pad_l + frac * pw if horizontal else pad_t + ph - frac * ph
 
-    # grid + value tick labels
+    # grid + value tick labels (precision of the tick step: 0, 2.5, 5, 7.5, not 0, 2, 5, 8)
+    tick_dec = _decimals(ticks)
     for t in ticks:
         p = vpos(t)
         if horizontal:
             out.append(f'<line x1="{p:.1f}" y1="{pad_t}" x2="{p:.1f}" y2="{pad_t + ph}" stroke="#{grid}"/>')
-            out.append(_text(p, pad_t + ph + 22, _fmt(t, dec if dec else 0), size=13, fill=theme.muted))
+            out.append(_text(p, pad_t + ph + 22, _fmt(t, tick_dec), size=13, fill=theme.muted))
         else:
             out.append(f'<line x1="{pad_l}" y1="{p:.1f}" x2="{pad_l + pw}" y2="{p:.1f}" stroke="#{grid}"/>')
-            out.append(_text(pad_l - 10, p, _fmt(t, dec if dec else 0), size=13, fill=theme.muted, anchor="end",
+            out.append(_text(pad_l - 10, p, _fmt(t, tick_dec), size=13, fill=theme.muted, anchor="end",
                              baseline="middle"))
 
     band = (ph if horizontal else pw) / n

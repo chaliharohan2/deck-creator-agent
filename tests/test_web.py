@@ -257,3 +257,106 @@ def test_event_log_collapses_progress_and_trims():
     for _ in range(5):
         log.add("note")
     assert len(log.since(0)) == 3 and log.last_id == 8
+
+
+def test_attachments_that_do_not_fit_are_reported(tmp_path):
+    client, state, factory = make_client(tmp_path, Factory(script=["ok"]))
+    post(client, "/api/chat", {"message": "m", "attachments": [
+        {"name": "full.txt", "text": "a" * 40_000}, {"name": "later.md", "text": "important"}]})
+    wait_idle(state)
+    user = client.get("/api/events.json").json()["events"][0]
+    assert user["attachments"] == ["full.txt"] and user["omitted"] == ["later.md"] and user["truncated"] is True
+    assert "important" not in factory.instances[0].prompts[0]
+
+
+def test_empty_reply_and_failed_autosave_are_shown(tmp_path):
+    blocker = tmp_path / "not_a_folder"
+    blocker.write_text("x")  # the output "folder" is a file, so saving fails
+    settings = Settings(output_dir=blocker, web=False, model="fake:4b", verify_numbers=False)
+    app = create_app(settings, llm_factory=Factory(script=BUILD_SCRIPT[:2] + [""]))
+    client, state = TestClient(app, base_url="http://127.0.0.1:7860"), app.state.ui
+    post(client, "/api/chat", {"message": "go"})
+    wait_idle(state)
+    events = client.get("/api/events.json").json()["events"]
+    assert any(e["type"] == "error" and "Could not save" in e["text"] for e in events)
+    assert any(e["type"] == "note" and "without a written reply" in e["text"] for e in events)
+
+
+def test_new_deck_forgets_old_sources(tmp_path):
+    client, state, _ = make_client(tmp_path, Factory(script=["ok"]))
+    post(client, "/api/chat", {"message": "Sales were 4,321 units, see https://old.example/r"})
+    wait_idle(state)
+    assert state.session.facts.supports(number_figure(4321))
+    post(client, "/api/reset")
+    assert not state.session.facts.supports(number_figure(4321)) and not state.session.known_urls
+
+
+def test_theme_picked_in_the_ui_is_kept(tmp_path):
+    client, state, _ = make_client(tmp_path, Factory(script=[
+        [("set_deck_info", {"title": "T"})], "ok",
+        [("set_deck_info", {"title": "T2", "theme": "forest"})], "ok",
+        [("set_deck_info", {"title": "T3", "theme": "forest"})], "ok"]))
+    post(client, "/api/chat", {"message": "go"})
+    wait_idle(state)
+    post(client, "/api/theme", {"theme": "dark"})
+    post(client, "/api/chat", {"message": "rename it to T2"})
+    wait_idle(state)
+    assert state.session.deck.title == "T2" and state.session.deck.theme == "dark"
+    post(client, "/api/chat", {"message": "use the forest theme"})
+    wait_idle(state)
+    assert state.session.deck.theme == "forest"
+
+
+def test_bad_query_parameters(tmp_path):
+    client, _, _ = make_client(tmp_path)
+    assert client.get("/api/events.json?since=abc").status_code == 400
+
+
+def _tiny_pdf(text: str) -> bytes:
+    """A minimal one-page PDF with a line of text (enough for pypdf's extractor)."""
+    stream = f"BT /F1 24 Tf 72 720 Td ({text}) Tj ET".encode()
+    objects = [b"<< /Type /Catalog /Pages 2 0 R >>",
+               b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+               b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R "
+               b"/Resources << /Font << /F1 5 0 R >> >> >>",
+               b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream",
+               b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
+    out, offsets = bytearray(b"%PDF-1.4\n"), []
+    for i, body in enumerate(objects, 1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % i + body + b"\nendobj\n"
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+    out += b"".join(b"%010d 00000 n \n" % o for o in offsets)
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, xref)
+    return bytes(out)
+
+
+def test_extract_reads_a_real_pdf(tmp_path):
+    client, _, _ = make_client(tmp_path)
+    r = client.post("/api/extract?name=report.pdf", content=_tiny_pdf("Sales rose 13 percent"),
+                    headers={"Content-Type": "application/octet-stream"})
+    assert r.status_code == 200 and "Sales rose 13 percent" in r.json()["text"]
+
+
+def test_preview_folder_is_removed_on_shutdown(tmp_path):
+    settings = Settings(output_dir=tmp_path / "decks", web=False, model="fake:4b")
+    app = create_app(settings, llm_factory=Factory())
+    preview = app.state.ui.preview_dir
+    with TestClient(app, base_url="http://127.0.0.1:7860") as client:
+        assert client.get("/api/state").status_code == 200 and preview.exists()
+    assert not preview.exists()
+
+
+@pytest.mark.skipif(find_soffice() is None, reason="LibreOffice not installed")
+def test_old_previews_are_deleted(tmp_path):
+    client, state, _ = make_client(tmp_path, Factory(script=BUILD_SCRIPT[:2] + ["ok"]))
+    post(client, "/api/chat", {"message": "go"})
+    wait_idle(state)
+    assert client.get("/api/preview/pages").status_code == 200
+    post(client, "/api/theme", {"theme": "dark"})
+    pages = client.get("/api/preview/pages").json()
+    assert pages["version"] == state.deck_version
+    names = {p.name for p in state.preview_dir.iterdir()}
+    assert names == {f"preview_{pages['version']}.{ext}" for ext in ("pdf", "pptx", "deck.json")} | {
+        f"pages_{pages['version']}"}

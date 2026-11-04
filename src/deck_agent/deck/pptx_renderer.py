@@ -36,7 +36,17 @@ from deck_agent.deck.model import (
     TwoColumnSlide,
     bullet_level,
 )
-from deck_agent.deck.text import fit_font_size, mix, number_format, parse_inline, plain, sources_line
+from deck_agent.deck.text import (
+    fit_font_size,
+    fit_table,
+    is_numeric,
+    mix,
+    number_format,
+    parse_inline,
+    plain,
+    sources_line,
+    table_column_weights,
+)
 from deck_agent.deck.themes import Theme, get_theme
 
 SLIDE_W, SLIDE_H = 13.333, 7.5
@@ -426,33 +436,26 @@ class PptxRenderer:
         t = self.theme
         slide = self._content_slide(s.title)
         n_rows, n_cols = len(s.rows) + 1, len(s.headers)
-        longest = max(len(c) for row in [s.headers, *s.rows] for c in row) if s.rows else 10
-        size = 18 if n_rows <= 5 and n_cols <= 4 else 16 if n_rows <= 8 else 14 if n_rows <= 10 else 12
-        if longest > 60 or n_cols >= 6:
-            size = min(size, 13)
-        elif longest > 35:
-            size = min(size, 15)
-        row_h = max(0.42, size * 2.1 / 72)
-        avail = CONTENT_BOTTOM - CONTENT_TOP - 0.15
-        height = min(avail, row_h * n_rows)
+        weights = table_column_weights(s.headers, s.rows)
+        col_w = [CONTENT_W * w / sum(weights) for w in weights]
+        # Stop above the sources line so the last rows never sit under it or the footer.
+        avail = CONTENT_BOTTOM - (CONTENT_TOP + 0.1)
+        start = 18 if n_rows <= 5 and n_cols <= 4 else 16 if n_rows <= 8 else 14 if n_rows <= 10 else 12
+        size, heights = fit_table(s.headers, s.rows, col_w, avail, max_size=start if n_cols < 6 else min(start, 13))
         gframe = slide.shapes.add_table(n_rows, n_cols, Inches(MARGIN), Inches(CONTENT_TOP + 0.1),
-                                        Inches(CONTENT_W), Inches(height))
+                                        Inches(CONTENT_W), Inches(min(avail, sum(heights))))
         table = gframe.table
         style_id = gframe._element.graphic.graphicData.tbl.tblPr.find(qn("a:tableStyleId"))
         if style_id is not None:
             style_id.text = NO_STYLE_TABLE
         table.first_row = True
         table.horz_banding = False
-        # column widths proportional to content length (clamped)
-        weights = []
-        for c in range(n_cols):
-            longest_c = max(len(row[c]) for row in [s.headers, *s.rows])
-            weights.append(min(max(longest_c, 6), 40))
-        total_w = sum(weights)
-        for c, wgt in enumerate(weights):
-            table.columns[c].width = Emu(int(Inches(CONTENT_W) * wgt / total_w))
+        for c, w in enumerate(col_w):
+            table.columns[c].width = Emu(int(Inches(w)))
+        numeric = [all(is_numeric(row[c]) or not row[c] for row in s.rows) and any(row[c] for row in s.rows)
+                   for c in range(n_cols)]
         for r in range(n_rows):
-            table.rows[r].height = Inches(row_h)
+            table.rows[r].height = Inches(heights[r])
             for c in range(n_cols):
                 cell = table.cell(r, c)
                 header = r == 0
@@ -469,7 +472,8 @@ class PptxRenderer:
                 tf.clear()
                 tf.word_wrap = True
                 p = tf.paragraphs[0]
-                p.alignment = PP_ALIGN.RIGHT if (not header and _is_numeric(text)) else PP_ALIGN.LEFT
+                # numbers line up on the right; a numeric column's header follows them
+                p.alignment = PP_ALIGN.RIGHT if (numeric[c] or (not header and is_numeric(text))) else PP_ALIGN.LEFT
                 self._runs(p, text, size=size, bold=header, color=t.accent_text if header else t.text)
         return slide
 
@@ -486,18 +490,20 @@ class PptxRenderer:
         caption_h = 0.45 if s.caption else 0.0
         box_h = height - caption_h
         path = Path(s.image_path)
-        if not path.exists():
+        try:
+            with Image.open(path) as im:
+                iw, ih = im.size
+            scale = min(box_w / iw, box_h / ih)
+            w, h = iw * scale, ih * scale
+            x = box_x + (box_w - w) / 2
+            y = top + (box_h - h) / 2
+            pic = slide.shapes.add_picture(str(path), Inches(x), Inches(y), Inches(w), Inches(h))
+        except Exception:  # noqa: BLE001 - missing, unreadable or unsupported file (e.g. a hand-edited spec)
             self._card(slide, box_x, top, box_w, box_h)
-            self._text(slide, f"[missing image: {path.name}]", box_x, top + box_h / 2 - 0.2, box_w, 0.4,
+            label = "missing image" if not path.exists() else "unreadable image"
+            self._text(slide, f"[{label}: {path.name}]", box_x, top + box_h / 2 - 0.2, box_w, 0.4,
                        size=14, color=t.muted, align=PP_ALIGN.CENTER)
             return slide
-        with Image.open(path) as im:
-            iw, ih = im.size
-        scale = min(box_w / iw, box_h / ih)
-        w, h = iw * scale, ih * scale
-        x = box_x + (box_w - w) / 2
-        y = top + (box_h - h) / 2
-        pic = slide.shapes.add_picture(str(path), Inches(x), Inches(y), Inches(w), Inches(h))
         pic._element.nvPicPr.cNvPr.set("descr", s.caption or s.title)
         if s.caption:
             self._text(slide, s.caption, box_x, y + h + 0.08, box_w, 0.4, size=13, italic=True,
@@ -530,17 +536,6 @@ def _no_fill(parent, after: str) -> None:
     anchor = parent.find(after)
     if anchor is not None:
         anchor.addnext(sp)
-
-
-def _is_numeric(text: str) -> bool:
-    cleaned = text.replace(",", "").replace("%", "").replace("$", "").replace("€", "").replace("£", "").strip()
-    if not cleaned:
-        return False
-    try:
-        float(cleaned.lstrip("+-"))
-        return True
-    except ValueError:
-        return False
 
 
 def render_pptx(deck: Deck, path: str | Path) -> Path:

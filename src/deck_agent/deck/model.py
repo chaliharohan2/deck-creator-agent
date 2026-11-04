@@ -13,6 +13,7 @@ numbers as "45%"), but strict about things that would produce a broken slide
 from __future__ import annotations
 
 import json
+import math
 import re
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -117,21 +118,49 @@ def parse_number(value: Any) -> float:
     if isinstance(value, bool):
         raise ValueError("chart values must be numbers, not true/false")
     if isinstance(value, (int, float)):
-        return float(value)
-    if value is None or (isinstance(value, str) and value.strip().lower() in {"", "null", "none", "n/a", "na"}):
+        number = float(value)
+    elif value is None or (isinstance(value, str) and value.strip().lower() in {"", "null", "none", "n/a", "na"}):
         return 0.0
-    if isinstance(value, str):
-        cleaned = _NUMBER_CLEAN.sub("", value.strip())
+    else:
+        cleaned = _NUMBER_CLEAN.sub("", str(value).strip()).replace("−", "-")  # Unicode minus sign
         if cleaned.startswith("(") and cleaned.endswith(")"):  # accounting negative
             cleaned = "-" + cleaned[1:-1]
         try:
-            return float(cleaned)
+            number = float(cleaned)
         except ValueError:
-            pass
-    raise ValueError(
-        f"chart value {value!r} is not a plain number; use numbers only and put units "
-        "(%, $, millions, ...) in the axis title"
-    )
+            raise ValueError(
+                f"chart value {value!r} is not a plain number; use numbers only and put units "
+                "(%, $, millions, ...) in the axis title"
+            ) from None
+    if not math.isfinite(number):  # float("nan") / float("inf") parse, but cannot be drawn
+        raise ValueError(f"chart value {value!r} is not a finite number")
+    return number
+
+
+_THOUSANDS = re.compile(r"^\s*[-+(−]?[$€£¥₹]?\s?\d{1,3}(?:,\d{3})+(?:\.\d+)?\s*%?\)?\s*$")
+
+
+def parse_values(v: Any) -> list[float]:
+    """Parse a series' values: a list, one number, or a string such as "1, 2, 3" or "1;2;3".
+
+    A comma is a list separator unless the string is one number with thousands
+    separators ("1,234"), so "1, 2, 3" gives three values rather than 123.
+    """
+    if v is None:
+        return []
+    if not isinstance(v, (list, tuple)):
+        v = [v]
+    items: list[Any] = []
+    for x in v:
+        if isinstance(x, str) and re.search(r"[,;\n]", x) and not _THOUSANDS.match(x):
+            # "1, 2, 3", "1,234, 5,678" or "1;2;3\n": ";", newlines and ", " always separate;
+            # a bare "," separates unless it groups thousands. Empty ends from stray separators are ignored.
+            parts = [p for chunk in re.split(r"[;\n]|,\s+", x.strip(" ,;\n"))
+                     for p in ([chunk] if _THOUSANDS.match(chunk) else chunk.split(","))]
+            items.extend(parts)
+        else:
+            items.append(x)
+    return [parse_number(x) for x in items]
 
 
 def normalize_series(v: Any) -> Any:
@@ -152,6 +181,10 @@ def normalize_series(v: Any) -> Any:
         for i, s in enumerate(v):
             if isinstance(s, (list, tuple)):  # [[1, 2], [3, 4]]: bare value arrays
                 s = {"name": f"Series {i + 1}", "values": list(s)}
+            if isinstance(s, dict) and len(s) == 1:  # [{"Revenue": [1, 2]}]: name -> values
+                (key, vals), = s.items()
+                if key not in ("values", "data", "value", "y", "points") and isinstance(vals, (list, tuple, str)):
+                    s = {"name": key, "values": vals}
             if isinstance(s, dict):
                 if "values" not in s:
                     for alt in ("data", "value", "y", "points"):
@@ -171,13 +204,51 @@ def _clean_text(value: Any) -> str:
     return str(value).strip()
 
 
-def _string_list(value: Any) -> list[str]:
+def string_list(value: Any) -> list[str]:
+    """A list of sources/citations from a list or one string ("url1, url2", "url1; url2", lines)."""
     if value is None:
         return []
     if isinstance(value, str):
-        parts = re.split(r"[\n;]|,\s+(?=https?://)", value) if "\n" in value or "http" in value else [value]
-        return [p.strip() for p in parts if p.strip()]
-    return [str(v).strip() for v in value if v is not None and str(v).strip()]
+        value = [value]
+    out = []
+    for v in value:
+        if v is None:
+            continue
+        text = str(v)
+        parts = re.split(r"[\n;]|,\s*(?=https?://)", text) if "\n" in text or "http" in text else [text]
+        out.extend(p.strip() for p in parts if p.strip())
+    return out
+
+
+def normalize_headers(v: Any) -> list[str]:
+    """Table headers from a list or one string ("A | B" or "A, B")."""
+    if isinstance(v, str):
+        v = [h.strip() for h in v.strip().strip("|").split("|" if "|" in v else ",") if h.strip()]
+    elif isinstance(v, (list, tuple)) and len(v) == 1 and isinstance(v[0], str) and "|" in v[0]:
+        v = [h.strip() for h in v[0].strip().strip("|").split("|") if h.strip()]
+    return [_clean_text(h) for h in (v or [])]
+
+
+_MD_SEPARATOR = re.compile(r"^:?-{2,}:?$")
+
+
+def normalize_rows(v: Any) -> list[list[str]]:
+    """Table rows from lists, dicts ({"Country": "DE", ...}), "a | b" strings or a markdown table."""
+    if isinstance(v, str):
+        v = [line for line in v.splitlines() if line.strip()]
+    rows = []
+    for row in v or []:
+        if isinstance(row, dict):
+            row = list(row.values())
+        elif isinstance(row, str):
+            row = [c.strip() for c in row.strip().strip("|").split("|")]
+        elif not isinstance(row, (list, tuple)):
+            row = [row]
+        cells = ["" if c is None else _fmt_cell(c) for c in row]
+        if cells and all(_MD_SEPARATOR.match(c) for c in cells):  # markdown "|---|---|" line
+            continue
+        rows.append(cells)
+    return rows
 
 
 # --------------------------------------------------------------------------- slides
@@ -197,7 +268,7 @@ class SlideBase(BaseModel):
     @field_validator("sources", mode="before")
     @classmethod
     def _sources(cls, v: Any) -> list[str]:
-        return _string_list(v)
+        return string_list(v)
 
     @property
     def heading(self) -> str:
@@ -271,9 +342,7 @@ class ChartSeries(BaseModel):
     @field_validator("values", mode="before")
     @classmethod
     def _values(cls, v: Any) -> list[float]:
-        if isinstance(v, (int, float, str)):
-            v = [v]
-        return [parse_number(x) for x in (v or [])]
+        return parse_values(v)
 
 
 ChartType = Literal["column", "bar", "line", "pie", "doughnut", "area", "stacked_column", "stacked_bar"]
@@ -366,21 +435,12 @@ class TableSlide(SlideBase):
     @field_validator("headers", mode="before")
     @classmethod
     def _headers(cls, v: Any) -> list[str]:
-        if isinstance(v, str):
-            v = [h.strip() for h in v.split("|" if "|" in v else ",") if h.strip()]
-        return [_clean_text(h) for h in (v or [])]
+        return normalize_headers(v)
 
     @field_validator("rows", mode="before")
     @classmethod
     def _rows(cls, v: Any) -> list[list[str]]:
-        rows = []
-        for row in v or []:
-            if isinstance(row, dict):
-                row = list(row.values())
-            elif isinstance(row, str):
-                row = [c.strip() for c in row.strip().strip("|").split("|")]
-            rows.append(["" if c is None else _fmt_cell(c) for c in row])
-        return rows
+        return normalize_rows(v)
 
     @model_validator(mode="after")
     def _check_shape(self) -> TableSlide:

@@ -14,6 +14,7 @@ guard rails:
 from __future__ import annotations
 
 import json
+import re
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -78,6 +79,12 @@ class AgentResult:
     tool_calls: int = 0
     errors: int = 0
     stopped_reason: str = "done"
+
+
+def mentions_theme(text: str) -> bool:
+    """Does the user's message ask for a look ("dark theme", "use the warm style")?"""
+    text = text.lower()
+    return "theme" in text or any(re.search(rf"\b{name}\b", text) for name in THEMES)
 
 
 def _signature(name: str, args: dict[str, Any]) -> str:
@@ -146,6 +153,32 @@ class DeckAgent:
         self.session.reset()
         self.messages = [{"role": "system", "content": self.system_prompt()}]
 
+    def _close_open_tool_calls(self) -> None:
+        """Give every tool call of the last assistant turn a result message.
+
+        A run interrupted while executing tool calls (Ctrl+C, a crash) leaves calls
+        without results. Strict OpenAI-compatible servers reject such a conversation,
+        so every later request in the chat would fail.
+        """
+        for i in range(len(self.messages) - 1, 0, -1):
+            m = self.messages[i]
+            if m["role"] != "assistant":
+                continue
+            answered = {x.get("tool_call_id") for x in self.messages[i + 1:] if x["role"] == "tool"}
+            for call in m.get("tool_calls") or []:
+                if call["id"] not in answered:
+                    self.messages.append({"role": "tool", "tool_call_id": call["id"], "name": call["name"],
+                                          "content": "Not run: the request was interrupted."})
+            return
+
+    def _autosave(self) -> None:
+        if self.session.dirty and self.session.deck.slides:
+            try:
+                paths, note = self.session.save()
+                self.on_event("autosave", {"files": {k: str(v) for k, v in paths.items()}, "note": note})
+            except Exception as exc:  # noqa: BLE001 - report, never lose the run
+                self.on_event("autosave_error", {"error": str(exc)})
+
     # ------------------------------------------------------------------ context management
     def _approx_tokens(self) -> int:
         chars = self._schema_chars + sum(
@@ -170,10 +203,25 @@ class DeckAgent:
     # ------------------------------------------------------------------ main loop
     def run(self, user_message: str) -> AgentResult:
         self._cancel.clear()
+        self._close_open_tool_calls()
         self.registry.new_request()
         self.session.note_source(user_message)  # the user's URLs and numbers are legitimate sources
+        # A theme the user picked (--theme, the UI menu) stands unless this message asks for one.
+        self.session.theme_requested = mentions_theme(user_message)
         self.messages.append({"role": "user", "content": user_message})
         result = AgentResult(text="")
+        try:
+            self._loop(result)
+        except BaseException:
+            # Ctrl+C or an unexpected error: keep the conversation valid and save the work first.
+            self._close_open_tool_calls()
+            self._autosave()
+            raise
+        self._autosave()
+        result.files = dict(self.session.saved)
+        return result
+
+    def _loop(self, result: AgentResult) -> None:
         nudges = 0
         last_sig, last_output, last_ok, repeats = None, "", True, 0
         start_slides = len(self.session.deck.slides)
@@ -250,12 +298,3 @@ class DeckAgent:
         else:
             result.stopped_reason = "max_steps"
             result.text = f"Stopped after {self.settings.max_steps} steps."
-
-        if self.session.dirty and self.session.deck.slides:
-            try:
-                paths, note = self.session.save()
-                self.on_event("autosave", {"files": {k: str(v) for k, v in paths.items()}, "note": note})
-            except Exception as exc:  # noqa: BLE001 - report, never lose the run
-                self.on_event("autosave_error", {"error": str(exc)})
-        result.files = dict(self.session.saved)
-        return result

@@ -136,3 +136,43 @@ def test_make_llm():
     assert isinstance(make_llm("llamacpp", "m"), OpenAICompatLLM)
     with pytest.raises(ValueError):
         make_llm("cloud", "m")
+
+
+def _drop(request):
+    raise httpx.RemoteProtocolError("peer closed connection without sending complete message body")
+
+
+def _connect_timeout(request):
+    raise httpx.ConnectTimeout("timed out")
+
+
+def _garbage(request):
+    return httpx.Response(200, content=b'{"message": {"content": "a"}}\n<html>502 Bad Gateway</html>\n')
+
+
+@pytest.mark.parametrize("cls", [OllamaLLM, OpenAICompatLLM])
+@pytest.mark.parametrize(("handler", "message"), [
+    (_drop, "Lost the connection"),  # server crashed / ran out of memory mid-answer
+    (_connect_timeout, "Is it running"),
+    (_garbage, "malformed response"),
+])
+def test_transport_failures_become_llm_errors(cls, handler, message):
+    # Anything else escapes the agent loop, which then cannot stop cleanly and auto-save the deck.
+    llm = _client(cls("m", "http://h"), handler)
+    with pytest.raises(LLMError, match=message):
+        llm.chat(MESSAGES, TOOLS)
+    with pytest.raises(LLMError):
+        llm.list_models()
+
+
+def test_openai_stream_without_tool_call_index():
+    # Some servers omit "index"; argument fragments must still join into one call.
+    body = sse(
+        {"choices": [{"delta": {"tool_calls": [{"id": "a", "function": {"name": "web_search", "arguments": '{"qu'}}]}}]},
+        {"choices": [{"delta": {"tool_calls": [{"function": {"arguments": 'ery": "x"}'}}]}}]},
+        {"choices": [{"delta": {"tool_calls": [{"id": "b", "function": {"name": "web_search", "arguments": '{"query": "y"}'}}]}}]},
+    )
+    llm = _client(OpenAICompatLLM("m", "http://h"),
+                  lambda r: httpx.Response(200, content=body, headers={"content-type": "text/event-stream"}))
+    resp = llm.chat(MESSAGES, TOOLS)
+    assert [(c.id, c.arguments) for c in resp.tool_calls] == [("a", {"query": "x"}), ("b", {"query": "y"})]
