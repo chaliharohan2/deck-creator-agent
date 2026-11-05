@@ -157,7 +157,7 @@ def _garbage(request):
 @pytest.mark.parametrize("cls", [OllamaLLM, OpenAICompatLLM])
 @pytest.mark.parametrize(("handler", "message"), [
     (_drop, "Lost the connection"),  # server crashed / ran out of memory mid-answer
-    (_connect_timeout, "Is it running"),
+    (_connect_timeout, "Is (it|the server) running"),  # Ollama / a local OpenAI-compatible server or tunnel
     (_garbage, "malformed response"),
 ])
 def test_transport_failures_become_llm_errors(cls, handler, message):

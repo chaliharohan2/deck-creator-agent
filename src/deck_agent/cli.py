@@ -105,15 +105,16 @@ def build_parser() -> argparse.ArgumentParser:
 def settings_from_args(args: argparse.Namespace) -> Settings:
     from deck_agent.envfile import find_env_file, load_env_file
 
-    env_file = find_env_file(getattr(args, "env_file", None))
-    load_env_file(env_file)
-    s = Settings.from_env()
-    s.env_file = env_file
-    if getattr(args, "mode", None):
-        try:
+    # A missing --env-file or a bad value in the settings is a message, not a traceback.
+    try:
+        env_file = find_env_file(getattr(args, "env_file", None))
+        load_env_file(env_file)
+        s = Settings.from_env()
+        s.env_file = env_file
+        if getattr(args, "mode", None):
             s.use_mode(args.mode)
-        except ValueError as exc:
-            raise SystemExit(f"error: {exc}") from exc
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"error: {exc}") from exc
     mapping = {
         "backend": "backend", "base_url": "base_url", "model": "model", "api_key": "api_key",
         "num_ctx": "num_ctx", "temperature": "temperature", "think": "think", "timeout": "timeout",
@@ -142,11 +143,17 @@ def _make_llm(s: Settings):
     return llm
 
 
-def ensure_model(s: Settings, llm) -> None:
+def ensure_model(s: Settings, llm, models: list[str] | None = None) -> None:
     """In server mode the model name may be left out: use the (usually only) model the server serves."""
+    from deck_agent.llm import LLMError
+
     if s.model:
         return
-    models = llm.list_models()
+    if models is None:
+        try:
+            models = llm.list_models()
+        except LLMError as exc:  # e.g. the server is down: a message, not a traceback
+            raise SystemExit(f"error: could not ask the model server which model to use: {exc}") from exc
     if not models:
         raise SystemExit("The server reports no models; set DECK_AGENT_SERVER_MODEL in your .env file.")
     s.model = llm.model = models[0]
@@ -241,11 +248,11 @@ def _print_files(files: dict[str, Path]) -> None:
     console.print(Panel(table, title="Saved files", border_style="green", expand=False))
 
 
-def _header(s: Settings) -> None:
+def _header(s: Settings, base_url: str | None = None) -> None:
     from deck_agent.config import MODE_LABELS
 
     web = f"web: {s.search_backend}" if s.web else "web: off"
-    where = f" at {s.base_url}" if s.mode == "server" else ""
+    where = f" at {base_url or s.base_url}" if s.mode == "server" else ""
     console.print(f"[bold]deck-agent[/] {__version__} · {MODE_LABELS[s.mode]} · model [cyan]{escape(s.model)}[/] "
                   f"via {s.backend}{escape(where)} · {web} · output → {s.output_dir}/ ({', '.join(s.formats)})")
 
@@ -256,8 +263,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     request = " ".join(args.request)
     if args.request_file:
         request += "\n\nSource material:\n" + args.request_file.read_text(encoding="utf-8")
-    _header(s)
-    agent = _build_agent(s, interactive=False, verbose=args.verbose)
+    agent = _build_agent(s, interactive=False, verbose=args.verbose)  # first: it may detect the server's model
+    _header(s, getattr(agent.llm, "base_url", None))
     t0 = time.time()
     try:
         result = agent.run(request)  # on Ctrl+C the deck built so far is auto-saved before this raises
@@ -287,9 +294,9 @@ def cmd_chat(args: argparse.Namespace) -> int:
     except ImportError:
         pass
     s = settings_from_args(args)
-    _header(s)
-    console.print(f"[dim]{escape(CHAT_HELP)}[/]")
     agent = _build_agent(s, interactive=True, verbose=args.verbose)
+    _header(s, getattr(agent.llm, "base_url", None))
+    console.print(f"[dim]{escape(CHAT_HELP)}[/]")
     while True:
         try:
             line = console.input("\n[bold green]you>[/] ").strip()
@@ -467,9 +474,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                      + (" (API key set)" if s.api_key else "")))
         if s.backend == "openai":
             picked = not s.model
-            ensure_model(s, llm)
-            present = not models or s.model in models
-            if picked:
+            if picked and models:
+                ensure_model(s, llm, models)
+            present = bool(s.model) and (not models or s.model in models)
+            if not s.model:
+                detail = "the server lists no models; set DECK_AGENT_SERVER_MODEL in your .env file"
+            elif picked:
                 detail = f"{s.model} (the server's first model; set DECK_AGENT_SERVER_MODEL to choose)"
             elif present:
                 detail = s.model

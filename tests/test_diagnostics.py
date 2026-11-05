@@ -260,3 +260,54 @@ def test_generation_rate_ignores_burst_answers():
     assert burst.generation_rate is None
     streamed = LLMResponse(completion_tokens=150, seconds=20.0, first_output_seconds=5.0)
     assert streamed.generation_rate == 10.0
+
+
+def test_gpu_server_through_a_tunnel_gets_server_hints(tmp_path, monkeypatch):
+    # README: ssh -N -L 8000:localhost:8000, then DECK_AGENT_SERVER_URL=http://localhost:8000
+    monkeypatch.setattr(server, "HEARTBEAT_SECONDS", 0.3)
+    monkeypatch.setattr(server, "LOADING_CHECK_AFTER", 0.1)
+    monkeypatch.setattr(server, "LOADING_CHECK_EVERY", 0.1)
+
+    def no_ollama(url, model):
+        raise AssertionError("a GPU server has no Ollama model to poll")
+
+    monkeypatch.setattr(server, "ollama_model_loaded", no_ollama)
+    settings = Settings(output_dir=tmp_path / "decks", web=False, mode="server", backend="openai",
+                        base_url="http://localhost:8000", model="Qwen/Qwen3.8-27B")
+    logs, gate = [], threading.Event()
+    app = create_app(settings, llm_factory=lambda s: SlowLLM(["Done."], gate=gate), log=logs.append)
+    client, state = TestClient(app, base_url="http://127.0.0.1:7860"), app.state.ui
+    assert client.get("/api/state").json()["remote"] is True  # the browser shows the GPU-server hint
+    client.post("/api/chat", json={"message": "x"})
+    deadline = time.time() + 10
+    while not any("still waiting" in line for line in logs) and time.time() < deadline:
+        time.sleep(0.05)
+    gate.set()
+    _wait(state)
+    waiting = [line for line in logs if "still waiting" in line]
+    assert waiting and "waiting for the model server" in waiting[0] and "on a CPU" not in waiting[0]
+
+
+def test_a_stopped_step_is_not_reported_as_answered(tmp_path):
+    class Endless:
+        base_url = "http://ollama.invalid"
+
+        def chat(self, messages, tools, on_progress=None):
+            while True:  # writes until the user presses Stop (on_progress raises)
+                time.sleep(0.02)
+                on_progress(1, "writing")
+
+        def list_models(self):
+            return []
+
+        def close(self):
+            pass
+
+    logs = []
+    client, state = _app(tmp_path, Endless(), logs)
+    client.post("/api/chat", json={"message": "x"})
+    time.sleep(0.2)
+    client.post("/api/stop", json={})
+    _wait(state)
+    assert "step 1: stopped by the user before the model answered" in logs
+    assert not any("model answered in" in line for line in logs)

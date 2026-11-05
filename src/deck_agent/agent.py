@@ -237,7 +237,8 @@ class DeckAgent:
             try:
                 response: LLMResponse = self.llm.chat(self.messages, self._tool_schemas, on_progress=self._progress)
             except AgentCancelled:
-                self.on_event("llm_end", {"step": step, "prompt_tokens": 0, "completion_tokens": 0, "recovered": False})
+                self.on_event("llm_end", {"step": step, "prompt_tokens": 0, "completion_tokens": 0, "recovered": False,
+                                          "cancelled": True})
                 result.stopped_reason, result.text = "cancelled", "Stopped."
                 break
             except LLMError as exc:

@@ -64,6 +64,7 @@ LogFn = Callable[[str], None]
 HEARTBEAT_SECONDS = 30  # how often the terminal reports a step that is still waiting for the model
 LOADING_CHECK_AFTER = 5  # seconds into a step before asking Ollama whether it is still loading the model
 LOADING_CHECK_EVERY = 10
+MODELS_CACHE_SECONDS = 30  # how long the UI reuses a server's model list
 
 
 def default_llm_factory(s: Settings) -> BaseLLM:
@@ -120,6 +121,8 @@ def _args_preview(args: dict[str, Any]) -> str:
 def _step_report(data: dict[str, Any]) -> str:
     """Where a model step's time went. Prompt *time* is reported rather than a rate: Ollama reuses its
     cached prompt prefix between steps, so a tokens/second figure would look misleadingly high."""
+    if data.get("cancelled"):
+        return f"step {data['step']}: stopped by the user before the model answered"
     details = []
     if (data.get("load_seconds") or 0) >= 1:
         details.append(f"loading the model {fmt_duration(data['load_seconds'])}")
@@ -155,6 +158,7 @@ class UIState:
         self._waiting = False
         self._loading: bool | None = None  # Ollama is still reading the model into memory
         self.llm_factory = llm_factory or default_llm_factory
+        self._models_cache: dict[tuple[str, str | None], tuple[float, list[str]]] = {}
         self.search_backend = search_backend
         self.events = EventLog()
         self.session = DeckSession(output_dir=settings.output_dir, formats=["pptx"], default_theme=settings.theme,
@@ -249,7 +253,7 @@ class UIState:
             "version": __version__,
             "mode": self.settings.mode,
             "modes": self.modes(),
-            "remote": self.settings.is_remote,
+            "remote": self.settings.uses_server,  # a GPU server, even through an SSH tunnel
             "backend": self.settings.backend,
             "model": self.settings.model,
             "web": self.settings.web,
@@ -263,10 +267,18 @@ class UIState:
         }
 
     def models(self) -> list[str]:
-        try:
-            names = self.agent.llm.list_models()
-        except Exception:  # noqa: BLE001 - server may be down; the UI shows the configured model only
-            names = []
+        # Cached briefly per server: every page load asks, and an unreachable GPU server would
+        # otherwise hold up each load until the request times out.
+        key = (self.settings.backend, self.settings.base_url)
+        cached = self._models_cache.get(key)
+        if cached and time.time() - cached[0] < MODELS_CACHE_SECONDS:
+            names = list(cached[1])
+        else:
+            try:
+                names = self.agent.llm.list_models()
+            except Exception:  # noqa: BLE001 - server may be down; the UI shows the configured model only
+                names = []
+            self._models_cache[key] = (time.time(), list(names))
         if self.settings.model not in names:
             names.insert(0, self.settings.model)
         return names
@@ -351,7 +363,7 @@ class UIState:
     def _check_loading(self) -> None:
         """Ask Ollama whether the model is still being loaded, and tell the browser if that changed."""
         base_url = getattr(self.agent.llm, "base_url", None)
-        if self.settings.backend != "ollama" or self.settings.is_remote or self._step_tokens or not base_url:
+        if self.settings.backend != "ollama" or self.settings.uses_server or self._step_tokens or not base_url:
             return
         loaded = ollama_model_loaded(base_url, self.settings.model)
         loading = None if loaded is None else not loaded
@@ -373,7 +385,7 @@ class UIState:
                 last_check = now
             if self._waiting and now - last_log >= HEARTBEAT_SECONDS and waited >= HEARTBEAT_SECONDS:
                 self.log(explain_wait(self._step, waited, self._step_tokens, self._step_phase, bool(self._loading),
-                                      remote=self.settings.is_remote))
+                                      remote=self.settings.uses_server))
                 last_log = now
 
     def _run(self, prompt: str) -> None:
@@ -435,7 +447,7 @@ class UIState:
             s.verify_numbers = self.session.verify_numbers = bool(changes["verify_numbers"])
         if rebuild:
             self.agent.set_registry(self._registry())
-        self.events.add("settings", mode=s.mode, remote=s.is_remote, model=s.model, web=s.web,
+        self.events.add("settings", mode=s.mode, remote=s.uses_server, model=s.model, web=s.web,
                         verify_numbers=s.verify_numbers)
 
     def set_theme(self, theme: str) -> None:
