@@ -1,5 +1,7 @@
 # deck-creator-agent
 
+[![CI](https://github.com/chaliharohan2/deck-creator-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/chaliharohan2/deck-creator-agent/actions/workflows/ci.yml)
+
 An AI agent that turns a request like *"10 slides on heat pumps for our city council"* into a finished presentation. It researches the topic on the web, plans the deck, writes the slides (charts, tables, comparisons, speaker notes, sources), and saves **PowerPoint, PDF and HTML** files.
 
 * **Runs a local model.** Default `qwen3.5:9b` through [Ollama](https://ollama.com); works on a CPU or a 10–20 GB GPU. See [docs/MODELS.md](docs/MODELS.md).
@@ -296,11 +298,41 @@ Everything here is open source. Two limitations are inherent and you should know
 
 Details: [docs/LICENSES.md](docs/LICENSES.md).
 
-## Development
+## Development and CI/CD
 
 ```bash
 pip install -e ".[dev]"
-pytest            # ~175 tests; the agent loop and LLM clients use fakes/mocks, so no model is needed
+pytest            # ~235 tests; the agent loop and LLM clients use fakes/mocks, so no model is needed
 ruff check src tests
 ```
+
+**Run the same checks as CI.** [`scripts/ci.sh`](scripts/ci.sh) defines every CI step, and GitHub Actions calls that script. Your machine and CI therefore run identical commands, each time against a fresh virtualenv with freshly installed dependencies:
+
+```bash
+scripts/ci.sh setup                       # new .ci-venv with the latest dependencies
+EXTRAS=browser scripts/ci.sh setup        # ... including Playwright for the browser test
+scripts/ci.sh all                         # lint, tests, package smoke test (+ PDF / browser tests if installed)
+scripts/ci.sh test -k server_mode         # one step, with extra pytest arguments
+```
+
+| Workflow | Runs on | What it does |
+|---|---|---|
+| [CI](.github/workflows/ci.yml) | every push, pull requests, Mondays, manual | **Lint:** ruff and a JavaScript syntax check. **Tests:** Python 3.10–3.14. **Integration:** installs LibreOffice and Chromium, then tests PDF export and drives the web UI in a browser; a missing tool fails the job instead of skipping tests. **Package:** builds the wheel, installs it in a clean venv outside the source tree, and starts the installed web UI. |
+| [Release](.github/workflows/release.yml) | tags `v*`; dry run on PRs that change it | Runs CI, builds and smoke-tests the package, checks the tag matches `pyproject.toml`, then publishes a GitHub Release with the wheel and source archive. |
+
+To release a version, bump `version` in `pyproject.toml`, merge it to `main`, then push a matching tag:
+
+```bash
+git tag v0.2.0
+```
+```bash
+git push origin v0.2.0
+```
+
+Why CI passing here means it passes on GitHub:
+* **Same commands:** one script defines every step.
+* **Clean environment:** every run starts from a fresh virtualenv.
+* **Tools installed explicitly:** LibreOffice and Chromium are installed in the workflow and required by the tests that use them.
+* **Pinned versions:** ruff, Playwright and the Ubuntu runner image (`ubuntu-24.04`, not `latest`) are pinned.
+* **Current actions:** action versions run on GitHub's current Node runtime, and Dependabot keeps them current.
 

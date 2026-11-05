@@ -142,7 +142,9 @@ class BackgroundServer:
         import uvicorn
 
         self.port = port or free_port()
-        self.server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=self.port, log_level="warning"))
+        # timeout_graceful_shutdown: don't wait for a deliberately hanging request when the test ends.
+        self.server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=self.port, log_level="warning",
+                                                    timeout_graceful_shutdown=1))
         self.thread = threading.Thread(target=self.server.run, daemon=True)
 
     @property

@@ -30,7 +30,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.5"]
+# Development and CI tools. ruff is pinned exactly: a new ruff release can flag code that passed
+# yesterday, which is one way CI starts failing on GitHub while passing locally.
+dev = ["pytest>=8", "ruff==0.17.3", "build>=1.2", "twine>=5"]
+# Browser smoke test of the web UI. Pinned so CI installs the same Chromium build everywhere.
+browser = ["playwright==1.63.0"]
 
 [project.scripts]
 deck-agent = "deck_agent.cli:main"
@@ -43,6 +47,11 @@ deck_agent = ["web/static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "pdf: needs LibreOffice (skipped when it is missing, unless DECK_AGENT_CI_REQUIRE=pdf)",
+    "browser: drives the web UI in Chromium via Playwright (skipped unless installed)",
+]
 filterwarnings = ["ignore:Using `httpx` with `starlette.testclient`"]
 
 [tool.ruff]

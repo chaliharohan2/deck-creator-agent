@@ -1,0 +1,111 @@
+# Continuous integration. Every step runs scripts/ci.sh, the same script you can run locally,
+# so CI and your machine execute identical commands against freshly installed dependencies.
+name: CI
+
+on:
+  push:
+    branches: ["**"] # every branch (tags are handled by release.yml)
+  pull_request:
+  schedule:
+    - cron: "23 5 * * 1" # Mondays: catch breakage from new dependency releases before a user does
+  workflow_dispatch:
+  workflow_call: # used by release.yml so a release is only published after these checks pass
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+# Only which interpreter to use is set here; every other environment variable that affects a step is
+# set in scripts/ci.sh, so running the script locally reproduces CI exactly.
+env:
+  PYTHON: python # the interpreter actions/setup-python put on PATH; scripts/ci.sh builds its venv from it
+
+jobs:
+  lint:
+    name: Lint
+    # A pull request from a branch of this repository was already tested by its push event.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: scripts/ci.sh setup
+      - run: scripts/ci.sh lint
+
+  test:
+    name: Tests (Python ${{ matrix.python }})
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: scripts/ci.sh setup
+      - run: scripts/ci.sh test
+
+  integration:
+    name: PDF export and browser UI
+    # GitHub runners do not ship LibreOffice or Playwright's Chromium. They are installed here, and
+    # scripts/ci.sh makes their absence a failure, so these tests can never be skipped silently.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install LibreOffice
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libreoffice-impress fonts-crosextra-carlito
+          soffice --version
+      - run: scripts/ci.sh setup
+        env:
+          EXTRAS: browser
+      - name: Install Chromium for Playwright
+        run: .ci-venv/bin/python -m playwright install --with-deps chromium
+      - run: scripts/ci.sh integration
+
+  package:
+    name: Build and smoke-test the package
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: scripts/ci.sh setup
+      - run: scripts/ci.sh package
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          retention-days: 14
+          if-no-files-found: error

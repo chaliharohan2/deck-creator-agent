@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -41,3 +42,60 @@ def clear_deck_env(monkeypatch) -> None:
     for name in list(os.environ):
         if _is_deck_setting(name):
             monkeypatch.delenv(name, raising=False)
+
+
+# --------------------------------------------------------------------------- optional tools
+# Tests marked `pdf` need LibreOffice; tests marked `browser` need Playwright and its Chromium.
+# Locally they are skipped when the tool is missing. CI sets DECK_AGENT_CI_REQUIRE=pdf (or browser)
+# in the job that installs the tool, so there a missing tool is an error instead of a silent skip:
+# a job can never pass without running the tests it exists for.
+_OPTIONAL = {"pdf": "LibreOffice (soffice)", "browser": "Playwright + Chromium (pip install -e '.[browser]' "
+                                                        "&& python -m playwright install chromium)"}
+
+
+def _browser_available() -> bool:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return False
+    try:
+        with sync_playwright() as p:
+            return Path(p.chromium.executable_path).exists()
+    except Exception:  # noqa: BLE001 - driver problems mean "not available"
+        return False
+
+
+def pytest_collection_modifyitems(config, items):
+    from deck_agent.deck.render import find_soffice
+
+    required = {x.strip() for x in os.environ.get("DECK_AGENT_CI_REQUIRE", "").split(",") if x.strip()}
+    unknown = required - set(_OPTIONAL)
+    if unknown:
+        raise pytest.UsageError(f"DECK_AGENT_CI_REQUIRE: unknown requirement(s) {sorted(unknown)}")
+    used = {name for name in _OPTIONAL for item in items if name in item.keywords} | required
+    checks = {"pdf": lambda: find_soffice() is not None, "browser": _browser_available}
+    available = {name: checks[name]() for name in used}
+    missing = sorted(name for name in required if not available[name])
+    if missing:
+        raise pytest.UsageError("this CI job requires " + ", ".join(_OPTIONAL[m] for m in missing)
+                                + " but it is not installed")
+    for item in items:
+        for name, ok in available.items():
+            if name in item.keywords and not ok:
+                item.add_marker(pytest.mark.skip(reason=f"needs {_OPTIONAL[name]}"))
+
+
+@pytest.fixture(autouse=True)
+def _plain_cli_output(monkeypatch):
+    """CLI output in tests is plain text at a fixed width, whatever the environment says.
+
+    rich colours its output when FORCE_COLOR is set, even into a pipe, and wraps at $COLUMNS; tests
+    that read CLI output then pass or fail depending on the shell or CI runner that runs them.
+    (CI sets FORCE_COLOR for readable logs; this is how a test once passed locally and failed on
+    GitHub.) A console without a colour system is immune to both.
+    """
+    from rich.console import Console
+
+    from deck_agent import cli
+
+    monkeypatch.setattr(cli, "console", Console(color_system=None, force_terminal=False, width=250))
