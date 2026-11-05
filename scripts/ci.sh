@@ -22,6 +22,12 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 VENV="${CI_VENV:-.ci-venv}"
+
+# The environment of every step is set HERE, not in the workflow files: a variable set only in CI is
+# a difference between CI and your machine (FORCE_COLOR once made a test fail only on GitHub).
+export FORCE_COLOR=1                  # coloured logs (tests must not depend on it; see tests/conftest.py)
+export PIP_DISABLE_PIP_VERSION_CHECK=1
+export PYTHONDONTWRITEBYTECODE=1
 PY="$VENV/bin/python"
 
 say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }

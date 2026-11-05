@@ -22,9 +22,9 @@ defaults:
   run:
     shell: bash
 
+# Only which interpreter to use is set here; every other environment variable that affects a step is
+# set in scripts/ci.sh, so running the script locally reproduces CI exactly.
 env:
-  FORCE_COLOR: "1"
-  PIP_DISABLE_PIP_VERSION_CHECK: "1"
   PYTHON: python # the interpreter actions/setup-python put on PATH; scripts/ci.sh builds its venv from it
 
 jobs:

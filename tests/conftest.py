@@ -83,3 +83,19 @@ def pytest_collection_modifyitems(config, items):
         for name, ok in available.items():
             if name in item.keywords and not ok:
                 item.add_marker(pytest.mark.skip(reason=f"needs {_OPTIONAL[name]}"))
+
+
+@pytest.fixture(autouse=True)
+def _plain_cli_output(monkeypatch):
+    """CLI output in tests is plain text at a fixed width, whatever the environment says.
+
+    rich colours its output when FORCE_COLOR is set, even into a pipe, and wraps at $COLUMNS; tests
+    that read CLI output then pass or fail depending on the shell or CI runner that runs them.
+    (CI sets FORCE_COLOR for readable logs; this is how a test once passed locally and failed on
+    GitHub.) A console without a colour system is immune to both.
+    """
+    from rich.console import Console
+
+    from deck_agent import cli
+
+    monkeypatch.setattr(cli, "console", Console(color_system=None, force_terminal=False, width=250))
