@@ -38,7 +38,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from deck_agent import __version__
 from deck_agent.agent import DeckAgent
-from deck_agent.config import Settings
+from deck_agent.config import MODE_LABELS, MODES, Settings
 from deck_agent.deck.html_renderer import HtmlRenderer
 from deck_agent.deck.model import Deck
 from deck_agent.deck.render import PdfExportError, find_soffice, render_deck, safe_filename
@@ -68,7 +68,8 @@ LOADING_CHECK_EVERY = 10
 
 def default_llm_factory(s: Settings) -> BaseLLM:
     return make_llm(s.backend, s.model, s.base_url, temperature=s.temperature, top_p=s.top_p, top_k=s.top_k,
-                    num_ctx=s.num_ctx, think=s.think, timeout=s.timeout, api_key=s.api_key)
+                    num_ctx=s.num_ctx, think=s.think, timeout=s.timeout, api_key=s.api_key,
+                    auth_header=s.auth_header)
 
 
 # --------------------------------------------------------------------------- event log
@@ -161,6 +162,7 @@ class UIState:
                                    verify_numbers=settings.verify_numbers)
         self.agent = DeckAgent(self.llm_factory(settings), self._registry(), self.session, settings,
                                interactive=True, on_event=self._on_agent_event)
+        self._ensure_model()
         self.thread: threading.Thread | None = None
         self.lock = threading.Lock()
         self.deck_version = 0
@@ -219,9 +221,35 @@ class UIState:
             self.deck_version += 1
             self.events.add("deck", focus=focus, **self.deck_info())
 
+    def _ensure_model(self) -> None:
+        """Server mode may leave the model name out: use the first model the server serves."""
+        if self.settings.model:
+            return
+        try:
+            names = self.agent.llm.list_models()
+        except Exception as exc:  # noqa: BLE001 - shown in the chat; the user can fix .env and switch again
+            self.events.add("error", text=f"Could not ask the model server which models it serves: {exc}")
+            return
+        if names:
+            self.settings.model = self.agent.llm.model = names[0]
+            self.settings.save_active()
+
+    def modes(self) -> list[dict[str, Any]]:
+        out = []
+        for mode in MODES:
+            profile = self.settings.profile(mode)
+            available = profile is not None and (mode == "cpu" or self.settings.server_configured)
+            detail = profile.describe() if available else \
+                "Not configured: set DECK_AGENT_SERVER_URL, _API_KEY and _MODEL in your .env file"
+            out.append({"id": mode, "label": MODE_LABELS[mode], "available": available, "detail": detail})
+        return out
+
     def state(self) -> dict[str, Any]:
         return {
             "version": __version__,
+            "mode": self.settings.mode,
+            "modes": self.modes(),
+            "remote": self.settings.is_remote,
             "backend": self.settings.backend,
             "model": self.settings.model,
             "web": self.settings.web,
@@ -323,7 +351,7 @@ class UIState:
     def _check_loading(self) -> None:
         """Ask Ollama whether the model is still being loaded, and tell the browser if that changed."""
         base_url = getattr(self.agent.llm, "base_url", None)
-        if self.settings.backend != "ollama" or self._step_tokens or not base_url:
+        if self.settings.backend != "ollama" or self.settings.is_remote or self._step_tokens or not base_url:
             return
         loaded = ollama_model_loaded(base_url, self.settings.model)
         loading = None if loaded is None else not loaded
@@ -344,7 +372,8 @@ class UIState:
                 self._check_loading()
                 last_check = now
             if self._waiting and now - last_log >= HEARTBEAT_SECONDS and waited >= HEARTBEAT_SECONDS:
-                self.log(explain_wait(self._step, waited, self._step_tokens, self._step_phase, bool(self._loading)))
+                self.log(explain_wait(self._step, waited, self._step_tokens, self._step_phase, bool(self._loading),
+                                      remote=self.settings.is_remote))
                 last_log = now
 
     def _run(self, prompt: str) -> None:
@@ -381,13 +410,24 @@ class UIState:
         self._deck_fp = self._fingerprint()
         self.events.add("reset", **self.deck_info())
 
+    def _swap_llm(self) -> None:
+        old = self.agent.llm
+        self.agent.llm = self.llm_factory(self.settings)
+        old.close()
+
     def update_settings(self, changes: dict[str, Any]) -> None:
         s = self.settings
+        if changes.get("mode") and changes["mode"] != s.mode:
+            s.use_mode(str(changes["mode"]))  # ValueError (not configured) -> HTTP 400
+            self._loading = None
+            self._swap_llm()
+            self._ensure_model()
+            self.log(f"Switched to {MODE_LABELS[s.mode]}: {s.model} via {s.backend}"
+                     + (f" at {s.base_url}" if s.mode == "server" else ""))
         if "model" in changes and changes["model"] and changes["model"] != s.model:
             s.model = str(changes["model"])
-            old = self.agent.llm
-            self.agent.llm = self.llm_factory(s)
-            old.close()
+            s.save_active()
+            self._swap_llm()
         rebuild = False
         if "web" in changes and bool(changes["web"]) != s.web:
             s.web, rebuild = bool(changes["web"]), True
@@ -395,7 +435,8 @@ class UIState:
             s.verify_numbers = self.session.verify_numbers = bool(changes["verify_numbers"])
         if rebuild:
             self.agent.set_registry(self._registry())
-        self.events.add("settings", model=s.model, web=s.web, verify_numbers=s.verify_numbers)
+        self.events.add("settings", mode=s.mode, remote=s.is_remote, model=s.model, web=s.web,
+                        verify_numbers=s.verify_numbers)
 
     def set_theme(self, theme: str) -> None:
         if theme not in THEMES:
@@ -713,7 +754,11 @@ def serve(settings: Settings, host: str = "127.0.0.1", port: int = 7860, open_br
     app = create_app(settings, allowed_hosts=allowed, initial_deck=deck, deck_name=deck_path.name if deck_path else "",
                      log=log)
     url = f"http://{'127.0.0.1' if host in ('0.0.0.0', '::') else host}:{port}"
-    print(f"deck-agent UI running at {url}  (model: {settings.model}; press Ctrl+C to stop)")
+    where = f" at {settings.base_url}" if settings.mode == "server" else ""
+    print(f"deck-agent UI running at {url}  ({MODE_LABELS[settings.mode]}: {settings.model}{where}; "
+          "press Ctrl+C to stop)")
+    if settings.server_configured:
+        print("Switch between CPU and GPU server with the switch at the top of the page.")
     print("Open that address in your browser if it does not open by itself. Agent activity is logged below.")
     if allowed:
         print("WARNING: the UI has no login. Anyone who can reach this address can use the agent.")

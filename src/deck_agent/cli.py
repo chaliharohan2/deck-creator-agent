@@ -26,8 +26,12 @@ console = Console()
 # --------------------------------------------------------------------------- argument parsing
 def _add_model_args(p: argparse.ArgumentParser) -> None:
     g = p.add_argument_group("model server")
+    g.add_argument("--mode", choices=["cpu", "server"],
+                   help="cpu: a model on this computer via Ollama (default); server: the remote GPU server "
+                        "configured in your .env file (DECK_AGENT_SERVER_URL, _API_KEY, _MODEL)")
+    g.add_argument("--env-file", type=Path, help="settings file to load (default: ./.env if it exists)")
     g.add_argument("--backend", choices=["ollama", "openai"], help="ollama (default) or any OpenAI-compatible "
-                   "local server: llama.cpp llama-server, vLLM, SGLang, LocalAI")
+                   "server: vLLM, llama.cpp llama-server, SGLang, LocalAI")
     g.add_argument("--base-url", help="server URL (default: http://localhost:11434 for ollama, "
                    "http://localhost:8080/v1 for openai)")
     g.add_argument("-m", "--model", help="model name/tag (default: qwen3.5:9b)")
@@ -99,7 +103,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def settings_from_args(args: argparse.Namespace) -> Settings:
+    from deck_agent.envfile import find_env_file, load_env_file
+
+    env_file = find_env_file(getattr(args, "env_file", None))
+    load_env_file(env_file)
     s = Settings.from_env()
+    s.env_file = env_file
+    if getattr(args, "mode", None):
+        try:
+            s.use_mode(args.mode)
+        except ValueError as exc:
+            raise SystemExit(f"error: {exc}") from exc
     mapping = {
         "backend": "backend", "base_url": "base_url", "model": "model", "api_key": "api_key",
         "num_ctx": "num_ctx", "temperature": "temperature", "think": "think", "timeout": "timeout",
@@ -114,6 +128,7 @@ def settings_from_args(args: argparse.Namespace) -> Settings:
         s.web = False
     if getattr(args, "no_fact_check", False):
         s.verify_numbers = False
+    s.save_active()  # CLI overrides (e.g. --model) belong to the chosen mode
     return s
 
 
@@ -121,8 +136,21 @@ def settings_from_args(args: argparse.Namespace) -> Settings:
 def _make_llm(s: Settings):
     from deck_agent.llm import make_llm
 
-    return make_llm(s.backend, s.model, s.base_url, temperature=s.temperature, top_p=s.top_p, top_k=s.top_k,
-                    num_ctx=s.num_ctx, think=s.think, timeout=s.timeout, api_key=s.api_key)
+    llm = make_llm(s.backend, s.model, s.base_url, temperature=s.temperature, top_p=s.top_p, top_k=s.top_k,
+                   num_ctx=s.num_ctx, think=s.think, timeout=s.timeout, api_key=s.api_key,
+                   auth_header=s.auth_header)
+    return llm
+
+
+def ensure_model(s: Settings, llm) -> None:
+    """In server mode the model name may be left out: use the (usually only) model the server serves."""
+    if s.model:
+        return
+    models = llm.list_models()
+    if not models:
+        raise SystemExit("The server reports no models; set DECK_AGENT_SERVER_MODEL in your .env file.")
+    s.model = llm.model = models[0]
+    s.save_active()
 
 
 class ConsoleReporter:
@@ -198,6 +226,7 @@ def _build_agent(s: Settings, interactive: bool, verbose: bool):
                           verify_numbers=s.verify_numbers)
     registry = build_registry(s, session)
     llm = _make_llm(s)
+    ensure_model(s, llm)
     agent = DeckAgent(llm, registry, session, s, interactive=interactive, on_event=ConsoleReporter(verbose))
     return agent
 
@@ -213,9 +242,12 @@ def _print_files(files: dict[str, Path]) -> None:
 
 
 def _header(s: Settings) -> None:
+    from deck_agent.config import MODE_LABELS
+
     web = f"web: {s.search_backend}" if s.web else "web: off"
-    console.print(f"[bold]deck-agent[/] {__version__} · model [cyan]{s.model}[/] via {s.backend} · {web} · "
-                  f"output → {s.output_dir}/ ({', '.join(s.formats)})")
+    where = f" at {s.base_url}" if s.mode == "server" else ""
+    console.print(f"[bold]deck-agent[/] {__version__} · {MODE_LABELS[s.mode]} · model [cyan]{escape(s.model)}[/] "
+                  f"via {s.backend}{escape(where)} · {web} · output → {s.output_dir}/ ({', '.join(s.formats)})")
 
 
 # --------------------------------------------------------------------------- commands
@@ -411,10 +443,12 @@ def _timed_agent_request(s: Settings, llm):
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
+    from deck_agent.config import MODE_LABELS
     from deck_agent.diagnostics import (
         SLOW_ADVICE,
         SLOW_LOAD_ADVICE,
         SLOW_LOAD_SECONDS,
+        calibrate_with_text_request,
         estimate_speed,
         fmt_duration,
         ollama_placement,
@@ -422,14 +456,29 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     s = settings_from_args(args)
     rows: list[tuple[str, str, str]] = []  # (check, "ok" | "warn" | "optional" | "fail", details)
+    source = f"; settings from {s.env_file}" if s.env_file else ""
+    other = "server" if s.mode == "cpu" else "cpu"
+    switch = "" if (other == "server" and not s.server_configured) else f" (--mode {other} to test the other one)"
+    rows.append(("mode", "ok", f"{MODE_LABELS[s.mode]}{switch}{source}"))
     llm = _make_llm(s)
     try:
         models = llm.list_models()
-        rows.append(("model server", "ok", f"{s.backend} at {llm.base_url}"))
-        present = s.model in models or f"{s.model}:latest" in models or s.backend == "openai"
-        hint = "" if present else f" - run: ollama pull {s.model}"
-        rows.append(("model installed", "ok" if present else "fail",
-                     (s.model if present else f"{s.model} not found") + hint))
+        rows.append(("model server", "ok", f"{s.backend} at {llm.base_url}"
+                     + (" (API key set)" if s.api_key else "")))
+        if s.backend == "openai":
+            picked = not s.model
+            ensure_model(s, llm)
+            present = not models or s.model in models
+            if picked:
+                detail = f"{s.model} (the server's first model; set DECK_AGENT_SERVER_MODEL to choose)"
+            elif present:
+                detail = s.model
+            else:
+                detail = f"{s.model} is not served here; available: {', '.join(models[:8])}"
+        else:
+            present = s.model in models or f"{s.model}:latest" in models
+            detail = s.model if present else f"{s.model} not found - run: ollama pull {s.model}"
+        rows.append(("model installed", "ok" if present else "fail", detail))
         if present and s.backend == "ollama":
             caps = llm.capabilities()
             rows.append(("tool support", "ok" if "tools" in caps else "fail", ", ".join(caps) or "unknown"))
@@ -450,6 +499,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 placement = ollama_placement(llm.base_url, s.model)
                 if placement:
                     rows.append(("model placement", "ok", placement.text))
+            if not resp.generation_seconds:  # OpenAI-compatible servers report no timing breakdown
+                text_resp = llm.chat([{"role": "user", "content": "Write the numbers from 1 to 60, separated by "
+                                       "spaces, and nothing else."}], [])
+                calibrate_with_text_request(resp, text_resp)
             speed = estimate_speed(resp, resp.prompt_tokens or approx_tokens)
             if speed is None:
                 rows.append(("speed", "warn", f"could not measure (request took {resp.seconds:.0f}s)"))

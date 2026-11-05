@@ -19,6 +19,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -63,8 +64,12 @@ class LLMResponse:
     def generation_rate(self) -> float | None:
         if self.generation_seconds > 0 and self.completion_tokens:
             return self.completion_tokens / self.generation_seconds
-        if self.first_output_seconds is not None and self.seconds > self.first_output_seconds and self.completion_tokens:
-            return self.completion_tokens / (self.seconds - self.first_output_seconds)
+        # Without server timings, use the streaming window - unless the answer arrived in one burst
+        # (servers often send a finished tool call at once), which would give an absurd rate.
+        if self.first_output_seconds is not None and self.completion_tokens:
+            window = self.seconds - self.first_output_seconds
+            if window > 0.2 and window >= 0.25 * self.seconds:
+                return self.completion_tokens / window
         return None
 
 
@@ -96,6 +101,7 @@ class BaseLLM:
         think: bool = False,
         timeout: float = 900.0,
         api_key: str | None = None,
+        auth_header: str | None = None,
         extra_body: dict[str, Any] | None = None,
     ):
         self.model = model
@@ -108,10 +114,15 @@ class BaseLLM:
         self.timeout = timeout
         self.api_key = api_key
         self.extra_body = extra_body or {}
-        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-        # trust_env=False: the LLM server is local; corporate proxy variables must not intercept it.
-        self._http = httpx.Client(headers=headers, trust_env=False,
-                                  timeout=httpx.Timeout(connect=10.0, read=timeout, write=60.0, pool=10.0))
+        headers: dict[str, str] = {}
+        if api_key:
+            headers = {auth_header: api_key} if auth_header else {"Authorization": f"Bearer {api_key}"}
+        # A local server must not be routed through corporate proxy variables; a remote GPU server
+        # must be (HTTPS_PROXY, SSL_CERT_FILE), or it may be unreachable from a company network.
+        self.remote = _is_remote(self.base_url)
+        self._http = httpx.Client(headers=headers, trust_env=self.remote,
+                                  timeout=httpx.Timeout(connect=15.0 if self.remote else 10.0, read=timeout,
+                                                        write=60.0, pool=10.0))
 
     def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
              on_progress: ProgressFn | None = None) -> LLMResponse:
@@ -124,6 +135,12 @@ class BaseLLM:
         self._http.close()
 
     def _connect_error(self, exc: Exception) -> LLMError:
+        if self.remote:
+            return LLMError(
+                f"Cannot reach the model server at {self.base_url} ({exc.__class__.__name__}). Check that the "
+                "server is running, the URL and port are right, and that your network or VPN allows the "
+                "connection (try opening <url>/v1/models in a browser)."
+            )
         return LLMError(
             f"Cannot reach the {self.backend} server at {self.base_url} ({exc.__class__.__name__}). "
             "Is it running? For Ollama: `ollama serve` and `ollama pull " + self.model + "`."
@@ -248,6 +265,9 @@ class OllamaLLM(BaseLLM):
         except (json.JSONDecodeError, AttributeError):
             pass
         text = str(text)
+        if status in (401, 403):
+            return (f"The server at {self.base_url} rejected the API key (HTTP {status}). Check "
+                    "DECK_AGENT_SERVER_API_KEY in your .env file.")
         if "not found" in text and "model" in text:
             return f"Model '{self.model}' is not installed in Ollama. Run: ollama pull {self.model}"
         if "does not support tools" in text:
@@ -311,14 +331,15 @@ class OpenAICompatLLM(BaseLLM):
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": self._messages(messages),
-            "tools": tools,
-            "tool_choice": "auto",
             "stream": True,
             "stream_options": {"include_usage": True},
             "temperature": self.temperature,
             "top_p": self.top_p,
             "top_k": self.top_k,  # non-standard but honoured by llama.cpp, vLLM and SGLang
         }
+        if tools:  # vLLM rejects tool_choice without tools
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
         if self.think is not None:
             # Qwen3.x / many hybrid-reasoning templates read this flag (vLLM, SGLang, llama.cpp).
             payload["chat_template_kwargs"] = {"enable_thinking": bool(self.think)}
@@ -329,7 +350,7 @@ class OpenAICompatLLM(BaseLLM):
             with self._http.stream("POST", self._url("/chat/completions"), json=payload) as r:
                 if r.status_code != 200:
                     body = r.read().decode("utf-8", "replace")
-                    raise LLMError(f"Server error {r.status_code}: {body[:500]}")
+                    raise LLMError(self._explain(r.status_code, body))
                 if "text/event-stream" not in r.headers.get("content-type", ""):
                     resp = self._parse_full(json.loads(r.read()), known)
                 else:
@@ -338,6 +359,35 @@ class OpenAICompatLLM(BaseLLM):
             raise self._transport_error(exc) from exc
         resp.seconds = time.monotonic() - t0
         return resp
+
+    def _explain(self, status: int, body: str) -> str:
+        """Readable advice for the errors vLLM and other OpenAI-compatible servers return."""
+        message = body
+        try:
+            data = json.loads(body)
+            err = data.get("error", data) if isinstance(data, dict) else data
+            message = err.get("message", body) if isinstance(err, dict) else str(err)
+        except (json.JSONDecodeError, AttributeError):
+            pass
+        message = str(message)
+        if status in (401, 403):
+            return (f"The model server at {self.base_url} rejected the API key (HTTP {status}). Check "
+                    "DECK_AGENT_SERVER_API_KEY in your .env file.")
+        if status == 404 and "model" in message.lower():
+            return (f"The server does not serve a model called '{self.model}' ({message[:200]}). Set "
+                    "DECK_AGENT_SERVER_MODEL to one of the names `deck-agent doctor --mode server` lists.")
+        if status == 404:
+            return (f"Nothing found at {self._url('/chat/completions')} (HTTP 404). Check the server URL; vLLM "
+                    "serves its API under /v1.")
+        if "tool choice requires" in message or "enable-auto-tool-choice" in message:
+            return ("The server was started without tool calling, which the agent needs. Restart vLLM with "
+                    "`--enable-auto-tool-choice --tool-call-parser <parser>` (qwen3_coder for Qwen3.5 and newer, "
+                    "hermes for Qwen2.5/Qwen3).")
+        if "maximum context length" in message or "max_model_len" in message:
+            return (f"The conversation is longer than the server's context window ({message[:200]}). Lower "
+                    "DECK_AGENT_SERVER_NUM_CTX so older tool output is trimmed sooner, or start vLLM with a larger "
+                    "--max-model-len.")
+        return f"Server error {status}: {message[:500]}"
 
     def _parse_stream(self, r: httpx.Response, known: set[str], on_progress, t0: float | None = None) -> LLMResponse:
         content, reasoning = [], []
@@ -417,6 +467,8 @@ class OpenAICompatLLM(BaseLLM):
     def list_models(self) -> list[str]:
         try:
             r = self._http.get(self._url("/models"))
+            if r.status_code in (401, 403):
+                raise LLMError(self._explain(r.status_code, r.text))
             r.raise_for_status()
             return [m.get("id", "") for m in r.json().get("data", [])]
         except (httpx.HTTPError, json.JSONDecodeError) as exc:
@@ -442,6 +494,11 @@ def _delta_index(tc: dict[str, Any], fn: dict[str, Any], acc: dict[int, dict[str
 
 
 DEFAULT_BASE_URLS = {"ollama": "http://localhost:11434", "openai": "http://localhost:8080/v1"}
+
+
+def _is_remote(url: str) -> bool:
+    host = urlparse(url).hostname or "localhost"
+    return host not in ("localhost", "127.0.0.1", "::1", "0.0.0.0")
 
 
 def make_llm(backend: str, model: str, base_url: str | None = None, **kwargs: Any) -> BaseLLM:

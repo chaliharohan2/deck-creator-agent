@@ -241,3 +241,22 @@ def test_doctor_reports_speed_load_and_optional_pdf(monkeypatch, capsys):
 def test_doctor_fails_when_the_model_does_not_call_tools(monkeypatch, capsys):
     code, out = _doctor(monkeypatch, capsys, DoctorLLM(called=()), soffice="/usr/bin/soffice")
     assert code == 1 and "no tool call returned" in out
+
+
+def test_calibrate_speed_for_servers_without_timings():
+    from deck_agent.diagnostics import calibrate_with_text_request
+
+    # tool call arrived in one burst after 10 s; a text answer streamed 50 tokens in 2 s (25 tok/s)
+    tool = LLMResponse(prompt_tokens=3500, completion_tokens=100, seconds=10.0, first_output_seconds=9.9)
+    text = LLMResponse(completion_tokens=50, seconds=2.5, first_output_seconds=0.5)
+    calibrate_with_text_request(tool, text)
+    assert tool.generation_seconds == pytest.approx(4.0) and tool.prompt_seconds == pytest.approx(6.0)
+    est = estimate_speed(tool, 3500)
+    assert est.generation_rate == pytest.approx(25) and est.prompt_rate == pytest.approx(3500 / 6)
+
+
+def test_generation_rate_ignores_burst_answers():
+    burst = LLMResponse(completion_tokens=150, seconds=20.0, first_output_seconds=19.9)  # tool call sent at once
+    assert burst.generation_rate is None
+    streamed = LLMResponse(completion_tokens=150, seconds=20.0, first_output_seconds=5.0)
+    assert streamed.generation_rate == 10.0
