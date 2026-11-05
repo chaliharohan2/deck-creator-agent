@@ -165,6 +165,7 @@ button, select, textarea, input { font: inherit; color: inherit; }
 .deck-meta { display: flex; align-items: baseline; gap: 10px; min-width: 0; flex: 1 1 120px; }
 .deck-meta h2 { font-size: 15px; margin: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #deckCount { white-space: nowrap; }
+.mode-switch .tab.active { color: var(--accent); }
 .tabs { display: inline-flex; background: var(--panel-2); border: 1px solid var(--border); border-radius: 9px; padding: 2px; }
 .tab { border: 0; background: transparent; padding: 5px 12px; border-radius: 7px; cursor: pointer; font-size: 13px; color: var(--muted); }
 .tab.active { background: var(--panel); color: var(--text); box-shadow: var(--shadow); font-weight: 550; }

@@ -81,9 +81,13 @@ def test_ollama_connection_error_message():
     def handler(request):
         raise httpx.ConnectError("refused")
 
-    llm = _client(OllamaLLM("m", "http://h"), handler)
+    llm = _client(OllamaLLM("m", "http://localhost:11434"), handler)
     with pytest.raises(LLMError, match="Is it running"):
         llm.chat(MESSAGES, TOOLS)
+    # a remote GPU server gets network advice instead of "ollama serve"
+    remote = _client(OpenAICompatLLM("m", "http://gpu.example.com:8000"), handler)
+    with pytest.raises(LLMError, match="network or VPN allows the connection"):
+        remote.chat(MESSAGES, TOOLS)
 
 
 def test_ollama_recovers_tool_call_from_text():
@@ -158,7 +162,7 @@ def _garbage(request):
 ])
 def test_transport_failures_become_llm_errors(cls, handler, message):
     # Anything else escapes the agent loop, which then cannot stop cleanly and auto-save the deck.
-    llm = _client(cls("m", "http://h"), handler)
+    llm = _client(cls("m", "http://localhost:8080"), handler)
     with pytest.raises(LLMError, match=message):
         llm.chat(MESSAGES, TOOLS)
     with pytest.raises(LLMError):

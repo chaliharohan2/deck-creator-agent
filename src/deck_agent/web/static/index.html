@@ -14,7 +14,11 @@
     <span>Deck Agent</span>
   </div>
   <div class="controls">
-    <label class="field" title="Local model served by Ollama or your OpenAI-compatible server">
+    <div class="tabs mode-switch" id="modeSwitch" role="radiogroup" aria-label="Where the model runs">
+      <button type="button" class="tab" role="radio" data-mode="cpu">CPU</button>
+      <button type="button" class="tab" role="radio" data-mode="server">GPU server</button>
+    </div>
+    <label class="field" title="The model to use in the current mode">
       <span>Model</span>
       <select id="model" aria-label="Model"></select>
     </label>

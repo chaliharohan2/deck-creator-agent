@@ -54,6 +54,46 @@ The UI is plain HTML/CSS/JS served by Starlette + uvicorn (BSD-3); it loads noth
 
 Try the renderer without any model: `deck-agent sample -f pptx html pdf`.
 
+## CPU mode or GPU server mode
+
+deck-agent can use a model on **this computer** (CPU mode, via Ollama) or a model on a **remote GPU server** (server mode: vLLM or any OpenAI-compatible API). A GPU server is typically 10-30× faster and can run larger models.
+
+1. Put the server's details in a `.env` file. Git ignores it, so your key stays out of the repository.
+   ```bash
+   cp .env.example .env
+   ```
+   ```ini
+   DECK_AGENT_SERVER_URL=https://gpu.example.com        # "/v1" is added if missing
+   DECK_AGENT_SERVER_API_KEY=your-api-key
+   DECK_AGENT_SERVER_MODEL=cyankiwi/Qwen3.8-27B-AWQ-INT4 # as the server names it; empty = its first model
+   DECK_AGENT_MODE=cpu                                   # which mode to start in
+   ```
+   `VLLM_BASE_URL`, `VLLM_API_KEY` and `MODEL_NAME` are understood too. Variables set in your shell override the file, and `--env-file path` loads another file.
+2. Check the server: `deck-agent doctor --mode server`. It confirms the key is accepted, the model is served, and tool calling works, then measures speed.
+3. Switch whenever you like:
+   * **Web UI:** use the **CPU | GPU server** switch at the top of the page. Hovering it shows which model and server each mode uses. The conversation and deck carry over.
+   * **Command line:** add `--mode server` or `--mode cpu` to `run`, `chat`, `ui` or `doctor`.
+
+**Server requirements (vLLM).** The agent needs tool calling, so start vLLM with a tool-call parser:
+
+```bash
+vllm serve cyankiwi/Qwen3.8-27B-AWQ-INT4 --api-key "$KEY" --max-model-len 32768 \
+  --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3
+```
+
+Use `qwen3_coder` for Qwen3.5 and newer, and `hermes` for Qwen2.5/Qwen3. If the parser is missing, `doctor` says so.
+
+**Security.** Over plain `http://` the API key and everything in your decks (prompts, attached files) cross the network unencrypted. Put the server behind HTTPS (for example a Caddy or nginx reverse proxy with a certificate). Alternatively, use an SSH tunnel and point deck-agent at the local end:
+
+```bash
+ssh -N -L 8000:localhost:8000 user@your-gpu-server
+```
+```ini
+DECK_AGENT_SERVER_URL=http://localhost:8000
+```
+
+In server mode, your prompts and attachments are processed on that server rather than on your computer.
+
 ## Which model should I use?
 
 | Hardware | Model | `-m` |
@@ -155,11 +195,16 @@ These runs are why the guard rails exist. They are covered by unit tests with a 
 
 ## Configuration
 
-Every option can also be set with an environment variable:
+Every option can be set with an environment variable or in a `.env` file (see [`.env.example`](.env.example) and [CPU mode or GPU server mode](#cpu-mode-or-gpu-server-mode)):
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `DECK_AGENT_BACKEND` | `ollama` | `ollama` or `openai` (llama.cpp server, vLLM, SGLang, LocalAI) |
+| `DECK_AGENT_MODE` | `cpu` | `cpu` (local Ollama) or `server` (remote GPU server) |
+| `DECK_AGENT_SERVER_URL` / `_API_KEY` / `_MODEL` | – | the GPU server for server mode |
+| `DECK_AGENT_SERVER_BACKEND` | `openai` | `openai` (vLLM, SGLang, ...) or `ollama` |
+| `DECK_AGENT_SERVER_AUTH_HEADER` | – | send the key in this header instead of `Authorization: Bearer` |
+| `DECK_AGENT_SERVER_NUM_CTX` / `_THINK` | `32768` / `false` | context budget and reasoning mode on the server |
+| `DECK_AGENT_BACKEND` | `ollama` | CPU mode: `ollama` or `openai` (llama.cpp server, LocalAI) |
 | `DECK_AGENT_BASE_URL` | per backend | e.g. `http://localhost:11434`, `http://localhost:8080/v1` |
 | `DECK_AGENT_MODEL` | `qwen3.5:9b` | model name / tag |
 | `DECK_AGENT_NUM_CTX` | `32768` | context window (Ollama) |
@@ -232,6 +277,11 @@ To make it faster:
 | "Not enough free memory to load …" | Close applications, use `-m qwen3.5:4b`, or lower `--num-ctx`. |
 | "Cannot reach the ollama server" | Start Ollama (`ollama serve`, or the Ollama app) and check `deck-agent doctor`. |
 | "Model … is not installed" | `ollama pull <model>` |
+| "rejected the API key" (server mode) | Check `DECK_AGENT_SERVER_API_KEY` in `.env`. |
+| "does not serve a model called …" | Set `DECK_AGENT_SERVER_MODEL` to a name `deck-agent doctor --mode server` lists, or leave it empty. |
+| "started without tool calling" | Restart vLLM with `--enable-auto-tool-choice --tool-call-parser qwen3_coder`. |
+| "Cannot reach the model server" | Check the URL and port, that the server is running, and your VPN or firewall. Try `<url>/v1/models` in a browser. |
+| "longer than the server's context window" | Lower `DECK_AGENT_SERVER_NUM_CTX`, or start vLLM with a larger `--max-model-len`. |
 
 ### PDF export or "PowerPoint render" is greyed out
 

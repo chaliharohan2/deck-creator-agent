@@ -79,6 +79,22 @@ def estimate_speed(resp: LLMResponse, prompt_tokens: int) -> SpeedEstimate | Non
                          first + (STEPS_FOR_TEN_SLIDES - 1) * later)
 
 
+def calibrate_with_text_request(resp: LLMResponse, text_resp: LLMResponse) -> LLMResponse:
+    """Fill in prompt/writing times for servers that do not report them (OpenAI-compatible APIs).
+
+    A tool call may arrive in one burst at the end, so the time to first output says little.
+    A short plain-text answer streams token by token, which gives the writing speed; the rest of
+    the tool request's time is then the time spent reading its prompt.
+    """
+    window = text_resp.seconds - (text_resp.first_output_seconds or 0)
+    if resp.generation_seconds or not text_resp.completion_tokens or window < 0.2:
+        return resp
+    rate = text_resp.completion_tokens / window
+    resp.generation_seconds = resp.completion_tokens / rate if resp.completion_tokens else 0.0
+    resp.prompt_seconds = max(resp.seconds - resp.generation_seconds, 0.01)
+    return resp
+
+
 SLOW_ADVICE = (
     "To speed it up: use a smaller model (-m qwen3.5:4b); if you have a GPU, make sure Ollama uses it "
     "(`ollama ps` should say 100% GPU; a model split between GPU and CPU runs at close to CPU speed); close "
@@ -137,8 +153,13 @@ def ollama_placement(base_url: str, model: str, timeout: float = 5.0) -> Placeme
     return Placement(f"{pct}% in GPU/accelerator memory, the rest in system RAM ({memory})", True)
 
 
-def explain_wait(step: int, seconds: float, tokens: int, phase: str, loading: bool = False) -> str:
+def explain_wait(step: int, seconds: float, tokens: int, phase: str, loading: bool = False,
+                 remote: bool = False) -> str:
     """One line describing what the model is doing while we wait for it."""
+    if remote and not tokens:
+        return (f"step {step}: still waiting for the model server ({fmt_duration(seconds)}). Tool calls are only "
+                "shown once complete. If this is much slower than usual, the server may be busy with other "
+                "requests or the network may be slow; `deck-agent doctor --mode server` measures it.")
     if loading:
         return (f"step {step}: Ollama is still loading the model into memory ({fmt_duration(seconds)}). The first "
                 "load reads the whole model file from disk; with a slow disk, low free RAM or antivirus scanning it "

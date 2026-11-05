@@ -29,6 +29,9 @@ const ui = {
   stepTokens: 0,
   stepPhase: "",
   loading: false,          // Ollama is still reading the model into memory
+  runMode: "cpu",          // where the model runs: "cpu" (local Ollama) | "server" (remote GPU server)
+  remote: false,
+  modes: [],
   tool: "",                // label of the tool currently running
 };
 
@@ -38,6 +41,9 @@ const FIRST_STEP_HINT = "The model is reading the agent's instructions (about 3,
 const LOADING_HINT = "Ollama is reading the model file into memory. The first load after starting Ollama or your " +
   "computer can take minutes with a slow disk, little free RAM or antivirus scanning; after that the model stays " +
   "loaded for 30 minutes. If it fails after about 5 minutes, start Ollama with OLLAMA_LOAD_TIMEOUT=15m.";
+const SERVER_HINT = "Waiting for the GPU server. Each step finishes with one tool call (for example one slide), " +
+  "shown when it is complete. If this is much slower than usual the server may be busy or the network slow; " +
+  "the terminal running deck-agent shows details, and 'deck-agent doctor --mode server' measures the server.";
 const LATER_STEP_HINT = "Each step finishes with one tool call (for example one slide), which only appears when " +
   "it is complete. On a CPU a step can take a minute or more; the terminal running deck-agent shows details.";
 
@@ -175,6 +181,7 @@ function setRunning(running) {
   els.stop.hidden = !running;
   els.status.hidden = !running;
   els.model.disabled = els.web.disabled = els.factcheck.disabled = els.newDeck.disabled = running;
+  renderModes();
   ui.stepStart = 0;
   ui.tool = "";
   els.statusHint.hidden = true;
@@ -200,7 +207,10 @@ function updateStatus() {
   }
   const slow = !ui.stepTokens && (ui.loading ? secs >= 20 : secs >= 45);
   els.statusHint.hidden = !slow;
-  if (slow) els.statusHint.textContent = ui.loading ? LOADING_HINT : ui.step === 1 ? FIRST_STEP_HINT : LATER_STEP_HINT;
+  if (slow) {
+    els.statusHint.textContent = ui.remote ? SERVER_HINT
+      : ui.loading ? LOADING_HINT : ui.step === 1 ? FIRST_STEP_HINT : LATER_STEP_HINT;
+  }
 }
 setInterval(updateStatus, 1000);
 
@@ -300,7 +310,7 @@ async function showPdf() {
 
 function setMode(mode) {
   ui.mode = mode;
-  document.querySelectorAll(".tab").forEach((t) => {
+  document.querySelectorAll(".preview-bar .tab").forEach((t) => {
     const active = t.dataset.mode === mode;
     t.classList.toggle("active", active);
     t.setAttribute("aria-selected", String(active));
@@ -413,7 +423,47 @@ function connect() {
 }
 
 /* ------------------------------------------------------------------ settings */
+/* ------------------------------------------------------------------ CPU / GPU server mode */
+function renderModes() {
+  document.querySelectorAll("#modeSwitch .tab").forEach((b) => {
+    const info = ui.modes.find((m) => m.id === b.dataset.mode);
+    const active = b.dataset.mode === ui.runMode;
+    b.classList.toggle("active", active);
+    b.setAttribute("aria-checked", String(active));
+    b.disabled = ui.running || !info || !info.available;
+    b.title = info ? info.detail : "";
+  });
+}
+
+async function loadModels() {
+  const s = await (await fetch("/api/state")).json();
+  ui.modes = s.modes || [];
+  els.model.innerHTML = "";
+  (s.models || [s.model]).forEach((m) => els.model.add(new Option(m, m)));
+  applySettings(s);
+}
+
+document.querySelectorAll("#modeSwitch .tab").forEach((b) => b.addEventListener("click", async () => {
+  if (b.disabled || b.dataset.mode === ui.runMode) return;
+  const label = b.textContent;
+  b.disabled = true;
+  try {
+    await api("/api/settings", { mode: b.dataset.mode });
+    await loadModels();
+    toast(`Switched to ${label}: ${els.model.value}`);
+  } catch (err) {
+    toast(err.message);
+  } finally {
+    renderModes();
+  }
+}));
+
 function applySettings(s) {
+  if (s.mode) {
+    ui.runMode = s.mode;
+    ui.remote = !!s.remote;
+    renderModes();
+  }
   if (s.model) {
     if (![...els.model.options].some((o) => o.value === s.model)) els.model.add(new Option(s.model, s.model));
     els.model.value = s.model;
@@ -443,7 +493,7 @@ els.newDeck.addEventListener("click", async () => {
   if (ui.deck.count && !confirm("Start a new deck? The current conversation and deck will be cleared (saved files stay in the output folder).")) return;
   try { await api("/api/reset"); } catch (err) { toast(err.message); }
 });
-document.querySelectorAll(".tab").forEach((t) => t.addEventListener("click", () => { if (!t.disabled) setMode(t.dataset.mode); }));
+document.querySelectorAll(".preview-bar .tab").forEach((t) => t.addEventListener("click", () => { if (!t.disabled) setMode(t.dataset.mode); }));
 
 /* ------------------------------------------------------------------ composer */
 function renderChips() {
@@ -519,6 +569,7 @@ document.querySelectorAll(".downloads .btn").forEach((a) => a.addEventListener("
 async function init() {
   const res = await fetch("/api/state");
   const s = await res.json();
+  ui.modes = s.modes || [];
   els.model.innerHTML = "";
   (s.models || [s.model]).forEach((m) => els.model.add(new Option(m, m)));
   els.model.dataset.prev = s.model;
