@@ -14,6 +14,7 @@ Only ``httpx`` is used; no vendor SDK is required.
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -46,6 +47,25 @@ class LLMResponse:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     recovered_from_text: bool = False  # tool calls were parsed out of plain text
+    # Timing, for progress reports and `deck-agent doctor`.
+    seconds: float = 0.0  # wall clock for the whole request
+    first_output_seconds: float | None = None  # wall clock until the server streamed anything back
+    load_seconds: float = 0.0  # server-reported (Ollama): loading the model into memory
+    prompt_seconds: float = 0.0  # server-reported (Ollama): processing the prompt
+    generation_seconds: float = 0.0  # server-reported (Ollama): writing the answer
+
+    @property
+    def prompt_rate(self) -> float | None:
+        """Prompt tokens processed per second (None when the server does not report it)."""
+        return self.prompt_tokens / self.prompt_seconds if self.prompt_seconds > 0 and self.prompt_tokens else None
+
+    @property
+    def generation_rate(self) -> float | None:
+        if self.generation_seconds > 0 and self.completion_tokens:
+            return self.completion_tokens / self.generation_seconds
+        if self.first_output_seconds is not None and self.seconds > self.first_output_seconds and self.completion_tokens:
+            return self.completion_tokens / (self.seconds - self.first_output_seconds)
+        return None
 
 
 def _finalize(content: str, reasoning: str, calls: list[ToolCall], known_tools: set[str]) -> LLMResponse:
@@ -174,6 +194,7 @@ class OllamaLLM(BaseLLM):
         content, reasoning, raw_calls = [], [], []
         n = 0
         prompt_tokens = completion_tokens = 0
+        t0, first, done = time.monotonic(), None, {}
         try:
             with self._http.stream("POST", f"{self.base_url}/api/chat", json=payload) as r:
                 if r.status_code != 200:
@@ -186,6 +207,8 @@ class OllamaLLM(BaseLLM):
                     if chunk.get("error"):
                         raise LLMError(self._explain(500, chunk["error"]))
                     msg = chunk.get("message") or {}
+                    if first is None and (msg.get("thinking") or msg.get("content") or msg.get("tool_calls")):
+                        first = time.monotonic() - t0
                     if msg.get("thinking"):
                         reasoning.append(msg["thinking"])
                         n += 1
@@ -200,6 +223,7 @@ class OllamaLLM(BaseLLM):
                     if chunk.get("done"):
                         prompt_tokens = chunk.get("prompt_eval_count") or 0
                         completion_tokens = chunk.get("eval_count") or 0
+                        done = chunk
         except (httpx.HTTPError, json.JSONDecodeError) as exc:
             raise self._transport_error(exc) from exc
         calls = []
@@ -210,6 +234,11 @@ class OllamaLLM(BaseLLM):
                                   id=rc.get("id") or f"call_{uuid.uuid4().hex[:10]}"))
         resp = _finalize("".join(content), "".join(reasoning), calls, known_tools)
         resp.prompt_tokens, resp.completion_tokens = prompt_tokens, completion_tokens
+        resp.seconds, resp.first_output_seconds = time.monotonic() - t0, first
+        ns = 1e9  # Ollama reports durations in nanoseconds
+        resp.load_seconds = (done.get("load_duration") or 0) / ns
+        resp.prompt_seconds = (done.get("prompt_eval_duration") or 0) / ns
+        resp.generation_seconds = (done.get("eval_duration") or 0) / ns
         return resp
 
     def _explain(self, status: int, body: str) -> str:
@@ -224,6 +253,16 @@ class OllamaLLM(BaseLLM):
         if "does not support tools" in text:
             return (f"Model '{self.model}' does not support tool calling in Ollama. Choose a model with the "
                     "'tools' capability, e.g. qwen3.5:9b, gemma4:12b or granite4.2:8b.")
+        if "timed out waiting for llama-server" in text or "timed out waiting for llama runner" in text:
+            return (f"Ollama could not load '{self.model}' in time: reading the model into memory took longer than "
+                    "Ollama's load timeout (5 minutes by default). This happens with a slow or busy disk, too little "
+                    "free RAM, or antivirus software scanning the model file. Try again (a second load is faster), "
+                    "free some memory, start Ollama with OLLAMA_LOAD_TIMEOUT=15m, or use a smaller model "
+                    "(qwen3.5:4b).")
+        if "requires more system memory" in text or "out of memory" in text.lower():
+            return (f"Not enough free memory to load '{self.model}' with a {self.num_ctx:,}-token context "
+                    f"(Ollama: {text[:200]}). Close other apps, use a smaller model (qwen3.5:4b) or lower the "
+                    "context with --num-ctx 16384.")
         return f"Ollama error {status}: {text[:500]}"
 
     def list_models(self) -> list[str]:
@@ -285,22 +324,28 @@ class OpenAICompatLLM(BaseLLM):
             payload["chat_template_kwargs"] = {"enable_thinking": bool(self.think)}
         payload.update(self.extra_body)
         known = {t["function"]["name"] for t in tools}
+        t0 = time.monotonic()
         try:
             with self._http.stream("POST", self._url("/chat/completions"), json=payload) as r:
                 if r.status_code != 200:
                     body = r.read().decode("utf-8", "replace")
                     raise LLMError(f"Server error {r.status_code}: {body[:500]}")
                 if "text/event-stream" not in r.headers.get("content-type", ""):
-                    return self._parse_full(json.loads(r.read()), known)
-                return self._parse_stream(r, known, on_progress)
+                    resp = self._parse_full(json.loads(r.read()), known)
+                else:
+                    resp = self._parse_stream(r, known, on_progress, t0)
         except (httpx.HTTPError, json.JSONDecodeError) as exc:
             raise self._transport_error(exc) from exc
+        resp.seconds = time.monotonic() - t0
+        return resp
 
-    def _parse_stream(self, r: httpx.Response, known: set[str], on_progress) -> LLMResponse:
+    def _parse_stream(self, r: httpx.Response, known: set[str], on_progress, t0: float | None = None) -> LLMResponse:
         content, reasoning = [], []
         acc: dict[int, dict[str, str]] = {}
         usage: dict[str, Any] = {}
         n = 0
+        t0 = time.monotonic() if t0 is None else t0
+        first = None
         for line in r.iter_lines():
             if not line.startswith("data:"):
                 continue
@@ -313,6 +358,8 @@ class OpenAICompatLLM(BaseLLM):
             usage = chunk.get("usage") or usage
             for choice in chunk.get("choices") or []:
                 delta = choice.get("delta") or {}
+                if first is None and any(delta.get(k) for k in ("content", "reasoning_content", "reasoning", "tool_calls")):
+                    first = time.monotonic() - t0
                 piece = delta.get("reasoning_content") or delta.get("reasoning")
                 if piece:
                     reasoning.append(piece)
@@ -347,6 +394,7 @@ class OpenAICompatLLM(BaseLLM):
         resp = _finalize("".join(content), "".join(reasoning), calls, known)
         resp.prompt_tokens = usage.get("prompt_tokens", 0)
         resp.completion_tokens = usage.get("completion_tokens", 0)
+        resp.first_output_seconds = first
         return resp
 
     def _parse_full(self, data: dict[str, Any], known: set[str]) -> LLMResponse:

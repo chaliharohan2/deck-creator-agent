@@ -138,7 +138,10 @@ button, select, textarea, input { font: inherit; color: inherit; }
 .step.err .detail { white-space: normal; color: var(--warn); background: var(--warn-bg); padding: 3px 6px; border-radius: 6px; grid-column: 2 / 4; }
 .step.pending .icon::before { content: ""; display: inline-block; width: 10px; height: 10px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
 
-.status { display: flex; align-items: center; gap: 8px; padding: 6px 18px; color: var(--muted); font-size: 13px; border-top: 1px solid var(--border); }
+.status { display: flex; align-items: flex-start; gap: 8px; padding: 7px 18px; color: var(--muted); font-size: 13px; border-top: 1px solid var(--border); }
+.status .spinner { margin-top: 2px; }
+.status-body { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.status-hint { font-size: 12px; line-height: 1.45; color: var(--muted); opacity: .9; }
 .spinner { width: 14px; height: 14px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; flex: none; }
 @keyframes spin { to { transform: rotate(360deg); } }
 

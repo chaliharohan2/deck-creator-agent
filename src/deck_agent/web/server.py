@@ -43,6 +43,7 @@ from deck_agent.deck.html_renderer import HtmlRenderer
 from deck_agent.deck.model import Deck
 from deck_agent.deck.render import PdfExportError, find_soffice, render_deck, safe_filename
 from deck_agent.deck.themes import THEMES
+from deck_agent.diagnostics import explain_wait, fmt_duration, ollama_model_loaded
 from deck_agent.llm import BaseLLM, make_llm
 from deck_agent.tools import DeckSession, build_registry
 from deck_agent.tools.web import SearchBackend
@@ -59,6 +60,10 @@ MEDIA_TYPES = {
 _SLIDE_REF = re.compile(r"(?:Added|Updated) slide (\d+)|to position (\d+)")
 
 LLMFactory = Callable[[Settings], BaseLLM]
+LogFn = Callable[[str], None]
+HEARTBEAT_SECONDS = 30  # how often the terminal reports a step that is still waiting for the model
+LOADING_CHECK_AFTER = 5  # seconds into a step before asking Ollama whether it is still loading the model
+LOADING_CHECK_EVERY = 10
 
 
 def default_llm_factory(s: Settings) -> BaseLLM:
@@ -111,6 +116,24 @@ def _args_preview(args: dict[str, Any]) -> str:
     return " · ".join(parts)
 
 
+def _step_report(data: dict[str, Any]) -> str:
+    """Where a model step's time went. Prompt *time* is reported rather than a rate: Ollama reuses its
+    cached prompt prefix between steps, so a tokens/second figure would look misleadingly high."""
+    details = []
+    if (data.get("load_seconds") or 0) >= 1:
+        details.append(f"loading the model {fmt_duration(data['load_seconds'])}")
+    if data.get("prompt_seconds"):
+        details.append(f"reading the {data.get('prompt_tokens') or 0:,}-token prompt "
+                       f"{fmt_duration(data['prompt_seconds'])}")
+    elif data.get("prompt_tokens"):
+        details.append(f"{data['prompt_tokens']:,}-token prompt")
+    if data.get("completion_tokens"):
+        rate = data.get("generation_rate")
+        details.append(f"writing {data['completion_tokens']:,} tokens" + (f" at {rate:.1f} tok/s" if rate else ""))
+    head = f"step {data['step']}: model answered in {fmt_duration(data.get('seconds') or 0)}"
+    return head + (f" ({'; '.join(details)})" if details else "")
+
+
 def _first_line(text: str, n: int = 240) -> str:
     line = text.strip().splitlines()[0] if text.strip() else ""
     return line if len(line) <= n else line[: n - 1] + "…"
@@ -120,8 +143,16 @@ def _first_line(text: str, n: int = 240) -> str:
 class UIState:
     def __init__(self, settings: Settings, llm_factory: LLMFactory | None = None,
                  search_backend: SearchBackend | None = None, initial_deck: Deck | None = None,
-                 deck_name: str = ""):
+                 deck_name: str = "", log: LogFn | None = None):
         self.settings = settings
+        self.log: LogFn = log or (lambda message: None)
+        # What the model is doing right now, for the terminal heartbeat.
+        self._step = 0
+        self._step_started = 0.0
+        self._step_tokens = 0
+        self._step_phase = ""
+        self._waiting = False
+        self._loading: bool | None = None  # Ollama is still reading the model into memory
         self.llm_factory = llm_factory or default_llm_factory
         self.search_backend = search_backend
         self.events = EventLog()
@@ -216,17 +247,27 @@ class UIState:
     def _on_agent_event(self, kind: str, data: dict[str, Any]) -> None:
         if kind == "llm_start":
             self._last_progress = 0.0
-            self.events.add("llm_start", step=data["step"])
+            self._step, self._step_started = data["step"], time.time()
+            self._step_tokens, self._step_phase, self._waiting, self._loading = 0, "", True, None
+            # `t` lets the browser show how long this step has been running, even after a reload.
+            self.events.add("llm_start", step=data["step"], t=self._step_started)
         elif kind == "llm_progress":
             now = time.time()
+            self._step_tokens, self._step_phase = data["tokens"], data["phase"]
             if now - self._last_progress >= 0.5:
                 self._last_progress = now
                 self.events.add("progress", tokens=data["tokens"], phase=data["phase"],
                                 seconds=round(now - self._turn_started))
+        elif kind == "llm_end":
+            self._waiting = False
+            self.log(_step_report(data))
         elif kind == "llm_error":
+            self._waiting = False
             self.events.add("error", text=data["error"])
+            self.log(f"ERROR from the model server: {data['error']}")
         elif kind == "tool_call":
             self.events.add("tool_call", name=data["name"], summary=_args_preview(data["arguments"]))
+            self.log(f"  -> {data['name']}: {_args_preview(data['arguments'])}")
         elif kind == "tool_result":
             out = data["output"]
             summary = _first_line(out) if data["ok"] else out[:600]
@@ -235,6 +276,7 @@ class UIState:
             elif data["name"] in ("web_search", "search_images") and data["ok"]:
                 summary = f"{out.count('URL:') or out.count('image:')} results"
             self.events.add("tool_result", name=data["name"], ok=data["ok"], summary=summary)
+            self.log(f"     {'ok' if data['ok'] else 'ERROR (sent back to the model)'}: {_first_line(summary, 160)}")
             m = _SLIDE_REF.search(out)
             self.check_deck(focus=int(m.group(1) or m.group(2)) if m else None)
         elif kind == "nudge":
@@ -243,6 +285,7 @@ class UIState:
             self.events.add("saved", files=data["files"])
         elif kind == "autosave_error":
             self.events.add("error", text=f"Could not save the deck to the output folder: {data['error']}")
+            self.log(f"ERROR saving the deck: {data['error']}")
 
     # ------------------------------------------------------------------ actions
     def start_chat(self, message: str, attachments: list[dict[str, str]]) -> tuple[bool, str]:
@@ -270,9 +313,39 @@ class UIState:
                             omitted=omitted)
             self.events.add("status", running=True)
             self._turn_started = time.time()
+            extra = f" (+ {len(names)} attachment{'s' if len(names) != 1 else ''})" if names else ""
+            self.log(f"New request{extra}: {_first_line(message, 120) or '(attached material)'}")
             self.thread = threading.Thread(target=self._run, args=(prompt,), daemon=True, name="deck-agent")
             self.thread.start()
+            threading.Thread(target=self._heartbeat, args=(self.thread,), daemon=True, name="deck-agent-heartbeat").start()
             return True, ""
+
+    def _check_loading(self) -> None:
+        """Ask Ollama whether the model is still being loaded, and tell the browser if that changed."""
+        base_url = getattr(self.agent.llm, "base_url", None)
+        if self.settings.backend != "ollama" or self._step_tokens or not base_url:
+            return
+        loaded = ollama_model_loaded(base_url, self.settings.model)
+        loading = None if loaded is None else not loaded
+        if loading != self._loading and self._waiting:
+            self._loading = loading
+            self.events.add("waiting", step=self._step, loading=bool(loading))
+
+    def _heartbeat(self, worker: threading.Thread) -> None:
+        """While the agent runs, report steps that are still waiting for the model."""
+        last_log, last_check = time.time(), 0.0
+        while True:
+            worker.join(timeout=min(1.0, LOADING_CHECK_AFTER))
+            if not worker.is_alive():
+                return
+            now = time.time()
+            waited = now - self._step_started
+            if self._waiting and waited >= LOADING_CHECK_AFTER and now - last_check >= LOADING_CHECK_EVERY:
+                self._check_loading()
+                last_check = now
+            if self._waiting and now - last_log >= HEARTBEAT_SECONDS and waited >= HEARTBEAT_SECONDS:
+                self.log(explain_wait(self._step, waited, self._step_tokens, self._step_phase, bool(self._loading)))
+                last_log = now
 
     def _run(self, prompt: str) -> None:
         try:
@@ -290,8 +363,11 @@ class UIState:
         except Exception as exc:  # noqa: BLE001 - surface any crash in the chat instead of dying silently
             self.events.add("error", text=f"{exc.__class__.__name__}: {exc}")
         finally:
+            self._waiting = False
             self.check_deck()
-            self.events.add("status", running=False, seconds=round(time.time() - self._turn_started))
+            seconds = time.time() - self._turn_started
+            self.events.add("status", running=False, seconds=round(seconds))
+            self.log(f"Finished in {fmt_duration(seconds)}; the deck has {len(self.session.deck.slides)} slides.")
 
     def stop(self) -> None:
         self.agent.cancel()
@@ -413,8 +489,8 @@ class SameOriginPostMiddleware:
 # --------------------------------------------------------------------------- routes
 def create_app(settings: Settings, *, llm_factory: LLMFactory | None = None,
                search_backend: SearchBackend | None = None, allowed_hosts: list[str] | None = None,
-               initial_deck: Deck | None = None, deck_name: str = "") -> Starlette:
-    state = UIState(settings, llm_factory, search_backend, initial_deck=initial_deck, deck_name=deck_name)
+               initial_deck: Deck | None = None, deck_name: str = "", log: LogFn | None = None) -> Starlette:
+    state = UIState(settings, llm_factory, search_backend, initial_deck=initial_deck, deck_name=deck_name, log=log)
 
     async def json_body(request: Request) -> dict[str, Any]:
         if "application/json" not in request.headers.get("content-type", ""):
@@ -625,10 +701,20 @@ def serve(settings: Settings, host: str = "127.0.0.1", port: int = 7860, open_br
     allowed = None
     if host not in ("127.0.0.1", "localhost", "::1"):
         allowed = ["*"] if host in ("0.0.0.0", "::") else [host, "127.0.0.1", "localhost"]
+    from rich.console import Console
+    from rich.markup import escape
+
+    console = Console(highlight=False)
+
+    def log(message: str) -> None:
+        console.print(f"[dim]{time.strftime('%H:%M:%S')}[/] {escape(message)}", soft_wrap=True)
+
     deck = Deck.load_json(deck_path) if deck_path else None
-    app = create_app(settings, allowed_hosts=allowed, initial_deck=deck, deck_name=deck_path.name if deck_path else "")
+    app = create_app(settings, allowed_hosts=allowed, initial_deck=deck, deck_name=deck_path.name if deck_path else "",
+                     log=log)
     url = f"http://{'127.0.0.1' if host in ('0.0.0.0', '::') else host}:{port}"
     print(f"deck-agent UI running at {url}  (model: {settings.model}; press Ctrl+C to stop)")
+    print("Open that address in your browser if it does not open by itself. Agent activity is logged below.")
     if allowed:
         print("WARNING: the UI has no login. Anyone who can reach this address can use the agent.")
     if open_browser:

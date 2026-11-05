@@ -4,6 +4,7 @@
 const $ = (sel) => document.querySelector(sel);
 const els = {
   messages: $("#messages"), welcome: $("#welcome"), status: $("#status"), statusText: $("#statusText"),
+  statusHint: $("#statusHint"),
   form: $("#composer"), input: $("#input"), send: $("#send"), stop: $("#stop"), file: $("#file"),
   chips: $("#attachments"), model: $("#model"), web: $("#web"), factcheck: $("#factcheck"),
   newDeck: $("#newDeck"), title: $("#deckTitle"), count: $("#deckCount"), theme: $("#theme"),
@@ -23,7 +24,22 @@ const ui = {
   turn: null,              // { box, list, summary, steps, start }
   reloadTimer: null,
   knownSlides: 0,
+  step: 0,                 // current model step, for the status timer
+  stepStart: 0,            // ms since epoch when the step started (0 = not waiting for the model)
+  stepTokens: 0,
+  stepPhase: "",
+  loading: false,          // Ollama is still reading the model into memory
+  tool: "",                // label of the tool currently running
 };
+
+const FIRST_STEP_HINT = "The model is reading the agent's instructions (about 3,500 tokens) before it can answer. " +
+  "Without a suitable GPU this first step can take a few minutes; later steps are quicker. " +
+  "The terminal running deck-agent logs every step, and running 'deck-agent doctor' estimates your speed.";
+const LOADING_HINT = "Ollama is reading the model file into memory. The first load after starting Ollama or your " +
+  "computer can take minutes with a slow disk, little free RAM or antivirus scanning; after that the model stays " +
+  "loaded for 30 minutes. If it fails after about 5 minutes, start Ollama with OLLAMA_LOAD_TIMEOUT=15m.";
+const LATER_STEP_HINT = "Each step finishes with one tool call (for example one slide), which only appears when " +
+  "it is complete. On a CPU a step can take a minute or more; the terminal running deck-agent shows details.";
 
 const TOOL_LABELS = {
   web_search: "Searching the web", read_webpage: "Reading", search_images: "Finding images",
@@ -159,8 +175,34 @@ function setRunning(running) {
   els.stop.hidden = !running;
   els.status.hidden = !running;
   els.model.disabled = els.web.disabled = els.factcheck.disabled = els.newDeck.disabled = running;
+  ui.stepStart = 0;
+  ui.tool = "";
+  els.statusHint.hidden = true;
   if (running) els.statusText.textContent = "Starting…";
 }
+
+/* Status line: a live timer per model step, plus an explanation when a step is slow. */
+function updateStatus() {
+  if (!ui.running) return;
+  if (ui.tool) {
+    els.statusText.textContent = `${ui.tool}…`;
+    els.statusHint.hidden = true;
+    return;
+  }
+  if (!ui.stepStart) return;
+  const secs = Math.max(0, Math.round((Date.now() - ui.stepStart) / 1000));
+  if (ui.stepTokens) {
+    els.statusText.textContent = `Step ${ui.step} · ${ui.stepPhase === "thinking" ? "reasoning" : "writing"}… ${ui.stepTokens} tokens · ${formatSeconds(secs)}`;
+  } else if (ui.loading) {
+    els.statusText.textContent = `Step ${ui.step} · Ollama is loading the model into memory… ${formatSeconds(secs)}`;
+  } else {
+    els.statusText.textContent = `Step ${ui.step} · waiting for the model… ${formatSeconds(secs)}`;
+  }
+  const slow = !ui.stepTokens && (ui.loading ? secs >= 20 : secs >= 45);
+  els.statusHint.hidden = !slow;
+  if (slow) els.statusHint.textContent = ui.loading ? LOADING_HINT : ui.step === 1 ? FIRST_STEP_HINT : LATER_STEP_HINT;
+}
+setInterval(updateStatus, 1000);
 
 /* ------------------------------------------------------------------ deck preview */
 function renderOutline(focus) {
@@ -312,13 +354,26 @@ function handle(ev) {
       }
       break;
     case "llm_start":
-      els.statusText.textContent = ev.step === 1 ? "Reading the request…" : `Thinking (step ${ev.step})…`;
+      ui.step = ev.step;
+      ui.stepStart = ev.t ? ev.t * 1000 : Date.now();
+      ui.stepTokens = 0;
+      ui.stepPhase = "";
+      ui.loading = false;
+      ui.tool = "";
+      updateStatus();
+      break;
+    case "waiting":
+      if (ev.step === ui.step) { ui.loading = !!ev.loading; updateStatus(); }
       break;
     case "progress":
-      els.statusText.textContent = `${ev.phase === "thinking" ? "Reasoning" : "Writing"}… ${ev.tokens} tokens · ${formatSeconds(ev.seconds)}`;
+      ui.stepTokens = ev.tokens;
+      ui.stepPhase = ev.phase;
+      updateStatus();
       break;
     case "tool_call":
       addStep(ev.name, ev.summary);
+      ui.tool = TOOL_LABELS[ev.name] || ev.name;
+      updateStatus();
       break;
     case "tool_result":
       finishStep(ev.name, ev.ok, ev.summary);

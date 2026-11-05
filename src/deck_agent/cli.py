@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -364,33 +365,100 @@ def cmd_themes(_: argparse.Namespace) -> int:
     return 0
 
 
+def _timed_agent_request(s: Settings, llm):
+    """Send one full-size agent request (system prompt + all tool schemas), as every deck starts with.
+
+    A random tag at the start of the prompt defeats Ollama's prompt cache, so the timing is
+    that of a real first step. Returns (response, registry tool names, approx prompt tokens).
+    """
+    import tempfile
+    import threading
+    import uuid
+
+    from deck_agent.agent import DeckAgent
+    from deck_agent.diagnostics import fmt_duration, ollama_model_loaded
+    from deck_agent.tools import DeckSession, build_registry
+
+    with tempfile.TemporaryDirectory(prefix="deck-agent-doctor-") as tmp:
+        session = DeckSession(output_dir=Path(tmp))
+        registry = build_registry(s, session)
+        system = DeckAgent(llm, registry, session, s).messages[0]["content"]
+    tools = registry.schemas()
+    messages = [
+        {"role": "system", "content": f"(diagnostic run {uuid.uuid4().hex[:8]})\n{system}"},
+        {"role": "user", "content": "Create a 3-slide deck about the history of tea for a book club."},
+    ]
+    approx_tokens = int((len(system) + len(json.dumps(tools))) / 3.2)
+    done = threading.Event()
+    with console.status(f"[cyan]Timing a full-size agent request (~{approx_tokens:,} tokens, the size every "
+                        "deck starts with)…") as status:
+        def tick() -> None:
+            t0, loaded = time.time(), None
+            while not done.wait(1):
+                elapsed = time.time() - t0
+                if s.backend == "ollama" and not loaded and int(elapsed) % 5 == 0:
+                    loaded = ollama_model_loaded(llm.base_url, s.model)
+                doing = ("Ollama is loading the model into memory" if loaded is False
+                         else f"processing a full-size agent request (~{approx_tokens:,} tokens)")
+                status.update(f"[cyan]{doing}… {fmt_duration(elapsed)} (on a CPU this can take a few minutes)")
+
+        threading.Thread(target=tick, daemon=True).start()
+        try:
+            resp = llm.chat(messages, tools)
+        finally:
+            done.set()
+    return resp, set(registry.names), approx_tokens
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
+    from deck_agent.diagnostics import (
+        SLOW_ADVICE,
+        SLOW_LOAD_ADVICE,
+        SLOW_LOAD_SECONDS,
+        estimate_speed,
+        fmt_duration,
+        ollama_placement,
+    )
+
     s = settings_from_args(args)
-    rows: list[tuple[str, bool, str]] = []
+    rows: list[tuple[str, str, str]] = []  # (check, "ok" | "warn" | "optional" | "fail", details)
     llm = _make_llm(s)
     try:
         models = llm.list_models()
-        rows.append(("model server", True, f"{s.backend} at {llm.base_url}"))
+        rows.append(("model server", "ok", f"{s.backend} at {llm.base_url}"))
         present = s.model in models or f"{s.model}:latest" in models or s.backend == "openai"
         hint = "" if present else f" - run: ollama pull {s.model}"
-        rows.append(("model installed", present, (s.model if present else f"{s.model} not found") + hint))
+        rows.append(("model installed", "ok" if present else "fail",
+                     (s.model if present else f"{s.model} not found") + hint))
         if present and s.backend == "ollama":
             caps = llm.capabilities()
-            rows.append(("tool support", "tools" in caps, ", ".join(caps) or "unknown"))
+            rows.append(("tool support", "ok" if "tools" in caps else "fail", ", ".join(caps) or "unknown"))
         if present and not args.skip_llm_test:
-            console.print("[dim]Sending a tool-calling test prompt (first load can take a minute)…[/]")
-            tool = {"type": "function", "function": {
-                "name": "get_weather", "description": "Get the weather for a city",
-                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}
-            t0 = time.time()
-            resp = llm.chat([{"role": "user", "content": "What's the weather in Paris? Use the tool."}], [tool])
-            ok = bool(resp.tool_calls) and resp.tool_calls[0].name == "get_weather"
-            detail = f"{time.time() - t0:.1f}s, {resp.completion_tokens} tokens"
+            resp, tool_names, approx_tokens = _timed_agent_request(s, llm)
+            called = [c.name for c in resp.tool_calls]
+            ok = any(name in tool_names for name in called)
+            detail = f"called {', '.join(called)}" if called else "no tool call returned"
             if resp.recovered_from_text:
-                detail += " (parsed from text: server tool parser may be missing)"
-            rows.append(("tool-call test", ok, detail if ok else f"no tool call returned ({detail})"))
+                detail += " (parsed from text: the server's tool-call parser may be missing)"
+            rows.append(("tool-call test", "ok" if ok else "fail", detail))
+            if resp.load_seconds >= 0.5:
+                slow_load = resp.load_seconds >= SLOW_LOAD_SECONDS
+                rows.append(("model load", "warn" if slow_load else "ok",
+                             f"{fmt_duration(resp.load_seconds)} to load into memory"
+                             + (f". {SLOW_LOAD_ADVICE}" if slow_load else "")))
+            if s.backend == "ollama":
+                placement = ollama_placement(llm.base_url, s.model)
+                if placement:
+                    rows.append(("model placement", "ok", placement.text))
+            speed = estimate_speed(resp, resp.prompt_tokens or approx_tokens)
+            if speed is None:
+                rows.append(("speed", "warn", f"could not measure (request took {resp.seconds:.0f}s)"))
+            else:
+                slow = speed.verdict in ("slow", "very slow")
+                rows.append(("speed", "warn" if slow else "ok",
+                             speed.summary() + (f". {SLOW_ADVICE}" if slow else "")))
     except Exception as exc:  # noqa: BLE001
-        rows.append(("model server", False, str(exc)[:200]))
+        rows.append(("model server", "fail", str(exc)[:300]))
     finally:
         llm.close()
 
@@ -401,20 +469,23 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             backend = make_search_backend(s.search_backend, searxng_url=s.searxng_url, region=s.search_region,
                                           image_license=s.image_license, wikipedia_fallback=s.wikipedia_fallback)
             res = backend.text("python programming language", 2)
-            rows.append(("web search", bool(res), f"{s.search_backend}: {len(res)} results"))
+            rows.append(("web search", "ok" if res else "fail", f"{s.search_backend}: {len(res)} results"))
         except Exception as exc:  # noqa: BLE001
-            rows.append(("web search", False, f"{s.search_backend}: {str(exc)[:160]}"))
+            rows.append(("web search", "fail", f"{s.search_backend}: {str(exc)[:160]}"))
     soffice = find_soffice()
-    rows.append(("PDF export", bool(soffice), soffice or "LibreOffice not found (PPTX/HTML still work)"))
+    rows.append(("PDF export", "ok" if soffice else "optional",
+                 soffice or "LibreOffice not found: PDF export and the UI's PowerPoint render are off; "
+                            "PPTX and HTML work"))
 
+    styles = {"ok": "[green]ok", "warn": "[yellow]warn", "optional": "[cyan]optional", "fail": "[red]fail"}
     table = Table(title="deck-agent doctor")
     table.add_column("check")
     table.add_column("status")
     table.add_column("details")
-    for name, ok, detail in rows:
-        table.add_row(name, "[green]ok" if ok else "[red]fail", escape(detail))
+    for name, status, detail in rows:
+        table.add_row(name, styles[status], escape(detail))
     console.print(table)
-    return 0 if all(ok for _, ok, _ in rows) else 1
+    return 1 if any(status == "fail" for _, status, _ in rows) else 0
 
 
 def main(argv: list[str] | None = None) -> int:
