@@ -9,6 +9,7 @@ Two connection *modes* are supported and can be switched at any time:
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,6 +18,22 @@ from urllib.parse import urlparse
 MODES = ("cpu", "server")
 MODE_LABELS = {"cpu": "CPU (local)", "server": "GPU server"}
 _MODE_ALIASES = {"cpu": "cpu", "local": "cpu", "ollama": "cpu", "server": "server", "gpu": "server", "remote": "server"}
+
+
+def is_remote_url(url: str | None) -> bool:
+    """Is the server on another machine? Loopback addresses (127.x, ::1) and "localhost" are local.
+
+    Note that an SSH tunnel to a GPU server is "local" here: use :attr:`Settings.uses_server` to ask
+    whether the model runs on a server, and this function only for network questions (proxies).
+    """
+    host = (urlparse(url or "http://localhost").hostname or "localhost").lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return True  # a host name
+    return not (ip.is_loopback or ip.is_unspecified)
 
 
 def normalize_mode(mode: str) -> str:
@@ -40,8 +57,7 @@ class ConnectionProfile:
 
     @property
     def is_remote(self) -> bool:
-        host = urlparse(self.base_url or "http://localhost").hostname or "localhost"
-        return host not in ("localhost", "127.0.0.1", "::1", "0.0.0.0")
+        return is_remote_url(self.base_url)
 
     def describe(self) -> str:
         where = self.base_url or "default local address"
@@ -58,6 +74,22 @@ def _env_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int) -> int:
+    value = _env(name)
+    try:
+        return default if value is None else int(value.strip())
+    except ValueError:
+        raise ValueError(f"DECK_AGENT_{name} must be a whole number, got {value!r}") from None
+
+
+def _env_float(name: str, default: float) -> float:
+    value = _env(name)
+    try:
+        return default if value is None else float(value.strip())
+    except ValueError:
+        raise ValueError(f"DECK_AGENT_{name} must be a number, got {value!r}") from None
 
 
 @dataclass
@@ -119,6 +151,12 @@ class Settings:
     def is_remote(self) -> bool:
         return self._active_profile().is_remote
 
+    @property
+    def uses_server(self) -> bool:
+        """The model runs on a model server, not on this computer's Ollama: GPU-server mode, which may be
+        reached through an SSH tunnel on localhost, or a remote URL. Drives progress hints and advice."""
+        return self.mode == "server" or self.is_remote
+
     def profile(self, mode: str) -> ConnectionProfile | None:
         mode = normalize_mode(mode)
         if mode == self.mode:
@@ -146,13 +184,13 @@ class Settings:
         s.base_url = _env("BASE_URL", s.base_url)
         s.model = _env("MODEL", s.model)
         s.api_key = _env("API_KEY", s.api_key)
-        s.temperature = float(_env("TEMPERATURE", str(s.temperature)))
-        s.top_p = float(_env("TOP_P", str(s.top_p)))
-        s.top_k = int(_env("TOP_K", str(s.top_k)))
-        s.num_ctx = int(_env("NUM_CTX", str(s.num_ctx)))
+        s.temperature = _env_float("TEMPERATURE", s.temperature)
+        s.top_p = _env_float("TOP_P", s.top_p)
+        s.top_k = _env_int("TOP_K", s.top_k)
+        s.num_ctx = _env_int("NUM_CTX", s.num_ctx)
         s.think = _env_bool("THINK", s.think)
-        s.timeout = float(_env("TIMEOUT", str(s.timeout)))
-        s.max_steps = int(_env("MAX_STEPS", str(s.max_steps)))
+        s.timeout = _env_float("TIMEOUT", s.timeout)
+        s.max_steps = _env_int("MAX_STEPS", s.max_steps)
         s.output_dir = Path(_env("OUTPUT_DIR", str(s.output_dir)))
         formats = _env("FORMATS")
         if formats:
@@ -164,9 +202,9 @@ class Settings:
         s.searxng_url = _env("SEARXNG_URL", s.searxng_url)
         s.search_region = _env("SEARCH_REGION", s.search_region)
         s.image_license = _env("IMAGE_LICENSE", s.image_license)
-        s.max_page_chars = int(_env("MAX_PAGE_CHARS", str(s.max_page_chars)))
-        s.max_searches = int(_env("MAX_SEARCHES", str(s.max_searches)))
-        s.max_reads = int(_env("MAX_READS", str(s.max_reads)))
+        s.max_page_chars = _env_int("MAX_PAGE_CHARS", s.max_page_chars)
+        s.max_searches = _env_int("MAX_SEARCHES", s.max_searches)
+        s.max_reads = _env_int("MAX_READS", s.max_reads)
         s.allow_private_urls = _env_bool("ALLOW_PRIVATE_URLS", s.allow_private_urls)
         s.verify_numbers = _env_bool("VERIFY_NUMBERS", s.verify_numbers)
         s.local = s._active_profile()
@@ -180,9 +218,12 @@ class Settings:
                 api_key=_env("SERVER_API_KEY") or os.environ.get("VLLM_API_KEY") or None,
                 auth_header=_env("SERVER_AUTH_HEADER"),
                 think=_env_bool("SERVER_THINK", False),
-                num_ctx=int(_env("SERVER_NUM_CTX", "32768")),
+                num_ctx=_env_int("SERVER_NUM_CTX", 32768),
             )
-        mode = normalize_mode(_env("MODE", "cpu"))
+        try:
+            mode = normalize_mode(_env("MODE", "cpu"))
+        except ValueError as exc:
+            raise ValueError(f"DECK_AGENT_MODE: {exc}") from None
         if mode == "server":
             s.use_mode("server")
         return s

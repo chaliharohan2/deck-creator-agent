@@ -11,26 +11,37 @@ import re
 from pathlib import Path
 
 _LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
+# Inside double quotes: \" \\ \n \t \r, as in python-dotenv. Other backslashes stay (C:\Users\me).
+_DOUBLE_QUOTED = re.compile(r'"((?:[^"\\]|\\.)*)"', re.S)
+_ESCAPE = re.compile(r"\\([\\\"'ntr])")
+_ESCAPES = {"n": "\n", "t": "\t", "r": "\r"}
+
+
+def _value(raw: str) -> str:
+    """The value part of a line: quoted (anything after the closing quote, e.g. a comment, is
+    ignored) or unquoted (an inline comment needs whitespace before the ``#``)."""
+    if raw.startswith('"'):
+        m = _DOUBLE_QUOTED.match(raw)
+        if m:  # decode escapes in one pass, so "\\n" stays a backslash followed by n
+            return _ESCAPE.sub(lambda e: _ESCAPES.get(e.group(1), e.group(1)), m.group(1))
+    elif raw.startswith("'"):
+        end = raw.find("'", 1)
+        if end > 0:
+            return raw[1:end]  # single quotes are literal
+    return re.split(r"\s+#", raw, maxsplit=1)[0].strip()
 
 
 def parse_env_file(path: str | Path) -> dict[str, str]:
     """Parse ``KEY=value`` lines. Supports comments, ``export``, and single/double quotes."""
     values: dict[str, str] = {}
-    for raw in Path(path).read_text(encoding="utf-8").splitlines():
+    for raw in Path(path).read_text(encoding="utf-8-sig").splitlines():  # -sig: Notepad's BOM
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
         m = _LINE.match(line)
         if not m:
             continue  # not a KEY=value line; ignore rather than fail
-        key, value = m.group(1), m.group(2).strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            quote, value = value[0], value[1:-1]
-            if quote == '"':
-                value = value.replace('\\"', '"').replace("\\n", "\n").replace("\\\\", "\\")
-        else:
-            value = re.split(r"\s+#", value, maxsplit=1)[0].strip()  # inline comment after whitespace
-        values[key] = value
+        values[m.group(1)] = _value(m.group(2).strip())
     return values
 
 

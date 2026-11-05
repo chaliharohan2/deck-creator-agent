@@ -19,11 +19,15 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import urlparse
 
 import httpx
 
+from deck_agent.config import is_remote_url
 from deck_agent.toolcall_parse import extract_tool_calls, parse_arguments, strip_thinking
+
+# Listing models is a quick metadata call (the UI makes it on every page load): never wait for the
+# long answer timeout, and give up on an unreachable server sooner than the 15 s chat connect timeout.
+LIST_TIMEOUT = httpx.Timeout(8.0, connect=5.0)
 
 ProgressFn = Callable[[int, str], None]  # (approx tokens so far, phase: "thinking" | "writing")
 
@@ -119,7 +123,7 @@ class BaseLLM:
             headers = {auth_header: api_key} if auth_header else {"Authorization": f"Bearer {api_key}"}
         # A local server must not be routed through corporate proxy variables; a remote GPU server
         # must be (HTTPS_PROXY, SSL_CERT_FILE), or it may be unreachable from a company network.
-        self.remote = _is_remote(self.base_url)
+        self.remote = is_remote_url(self.base_url)
         self._http = httpx.Client(headers=headers, trust_env=self.remote,
                                   timeout=httpx.Timeout(connect=15.0 if self.remote else 10.0, read=timeout,
                                                         write=60.0, pool=10.0))
@@ -134,16 +138,27 @@ class BaseLLM:
     def close(self) -> None:
         self._http.close()
 
+    def _probe_url(self) -> str:
+        """An address the user can open in a browser to check the server answers."""
+        return self.base_url
+
+    def _explain(self, status: int, body: str) -> str:
+        return f"Server error {status}: {body[:500]}"
+
     def _connect_error(self, exc: Exception) -> LLMError:
+        where = f"at {self.base_url} ({exc.__class__.__name__})"
         if self.remote:
             return LLMError(
-                f"Cannot reach the model server at {self.base_url} ({exc.__class__.__name__}). Check that the "
-                "server is running, the URL and port are right, and that your network or VPN allows the "
-                "connection (try opening <url>/v1/models in a browser)."
+                f"Cannot reach the model server {where}. Check that the server is running, the URL and port are "
+                f"right, and that your network or VPN allows the connection (try opening {self._probe_url()} "
+                "in a browser)."
             )
-        return LLMError(
-            f"Cannot reach the {self.backend} server at {self.base_url} ({exc.__class__.__name__}). "
-            "Is it running? For Ollama: `ollama serve` and `ollama pull " + self.model + "`."
+        if self.backend == "ollama":
+            return LLMError(f"Cannot reach Ollama {where}. Is it running? Start it with `ollama serve`, then "
+                            f"`ollama pull {self.model}`.")
+        return LLMError(  # a local OpenAI-compatible server, or an SSH tunnel to the GPU server
+            f"Cannot reach the model server {where}. Is the server running on that port? If this is an SSH "
+            "tunnel to your GPU server, check that the tunnel (ssh -N -L ...) is still open."
         )
 
     def _transport_error(self, exc: Exception) -> LLMError:
@@ -154,7 +169,16 @@ class BaseLLM:
         """
         if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
             return self._connect_error(exc)
+        if isinstance(exc, httpx.HTTPStatusError):  # the server answered, with an error status
+            try:
+                body = exc.response.text
+            except httpx.ResponseNotRead:
+                body = ""
+            return LLMError(self._explain(exc.response.status_code, body))
         if isinstance(exc, httpx.TimeoutException):
+            if exc.request.url.path.endswith(("/models", "/api/tags")):  # the quick model-list request
+                return LLMError(f"The model server at {self.base_url} accepted the connection but did not list "
+                                f"its models within {LIST_TIMEOUT.read:.0f}s; it may be overloaded or still starting.")
             return LLMError(f"The model did not answer within {self.timeout:.0f}s; try a smaller model or "
                             "raise --timeout.")
         if isinstance(exc, json.JSONDecodeError):
@@ -168,6 +192,9 @@ class OllamaLLM(BaseLLM):
     """Ollama native API (``POST /api/chat``) with streaming."""
 
     backend = "ollama"
+
+    def _probe_url(self) -> str:
+        return f"{self.base_url}/api/tags"
 
     def _messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         out = []
@@ -267,7 +294,7 @@ class OllamaLLM(BaseLLM):
         text = str(text)
         if status in (401, 403):
             return (f"The server at {self.base_url} rejected the API key (HTTP {status}). Check "
-                    "DECK_AGENT_SERVER_API_KEY in your .env file.")
+                    "the API key (DECK_AGENT_SERVER_API_KEY or VLLM_API_KEY in your environment or .env file).")
         if "not found" in text and "model" in text:
             return f"Model '{self.model}' is not installed in Ollama. Run: ollama pull {self.model}"
         if "does not support tools" in text:
@@ -287,7 +314,7 @@ class OllamaLLM(BaseLLM):
 
     def list_models(self) -> list[str]:
         try:
-            r = self._http.get(f"{self.base_url}/api/tags")
+            r = self._http.get(f"{self.base_url}/api/tags", timeout=LIST_TIMEOUT)
             r.raise_for_status()
             return [m["name"] for m in r.json().get("models", [])]
         except (httpx.HTTPError, json.JSONDecodeError) as exc:
@@ -305,9 +332,21 @@ class OpenAICompatLLM(BaseLLM):
 
     backend = "openai"
 
+    def __init__(self, model: str, base_url: str, **kwargs: Any):
+        # Accept the endpoint itself as the URL (".../v1/chat/completions", ".../v1/models").
+        base = base_url.rstrip("/")
+        for suffix in ("/chat/completions", "/completions", "/models"):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+                break
+        super().__init__(model, base, **kwargs)
+
     def _url(self, path: str) -> str:
         base = self.base_url if self.base_url.endswith("/v1") else self.base_url + "/v1"
         return base + path
+
+    def _probe_url(self) -> str:
+        return self._url("/models")
 
     def _messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         out = []
@@ -372,7 +411,7 @@ class OpenAICompatLLM(BaseLLM):
         message = str(message)
         if status in (401, 403):
             return (f"The model server at {self.base_url} rejected the API key (HTTP {status}). Check "
-                    "DECK_AGENT_SERVER_API_KEY in your .env file.")
+                    "the API key (DECK_AGENT_SERVER_API_KEY or VLLM_API_KEY in your environment or .env file).")
         if status == 404 and "model" in message.lower():
             return (f"The server does not serve a model called '{self.model}' ({message[:200]}). Set "
                     "DECK_AGENT_SERVER_MODEL to one of the names `deck-agent doctor --mode server` lists.")
@@ -404,7 +443,9 @@ class OpenAICompatLLM(BaseLLM):
                 break
             chunk = json.loads(data)
             if chunk.get("error"):
-                raise LLMError(f"Server error: {chunk['error']}")
+                err = chunk["error"]
+                code = err.get("code") if isinstance(err, dict) else None
+                raise LLMError(self._explain(code if isinstance(code, int) else 500, json.dumps(chunk)))
             usage = chunk.get("usage") or usage
             for choice in chunk.get("choices") or []:
                 delta = choice.get("delta") or {}
@@ -466,7 +507,7 @@ class OpenAICompatLLM(BaseLLM):
 
     def list_models(self) -> list[str]:
         try:
-            r = self._http.get(self._url("/models"))
+            r = self._http.get(self._url("/models"), timeout=LIST_TIMEOUT)
             if r.status_code in (401, 403):
                 raise LLMError(self._explain(r.status_code, r.text))
             r.raise_for_status()
@@ -494,11 +535,6 @@ def _delta_index(tc: dict[str, Any], fn: dict[str, Any], acc: dict[int, dict[str
 
 
 DEFAULT_BASE_URLS = {"ollama": "http://localhost:11434", "openai": "http://localhost:8080/v1"}
-
-
-def _is_remote(url: str) -> bool:
-    host = urlparse(url).hostname or "localhost"
-    return host not in ("localhost", "127.0.0.1", "::1", "0.0.0.0")
 
 
 def make_llm(backend: str, model: str, base_url: str | None = None, **kwargs: Any) -> BaseLLM:

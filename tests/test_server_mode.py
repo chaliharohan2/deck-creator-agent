@@ -235,7 +235,9 @@ def test_ui_switches_between_cpu_and_server(tmp_path, mock_server, monkeypatch):
 
     assert client.post("/api/settings", json={"mode": "server"}).status_code == 200
     state = client.get("/api/state").json()
-    assert state["mode"] == "server" and state["model"] == MODEL and state["models"] == [MODEL] and state["remote"] is False
+    assert state["mode"] == "server" and state["model"] == MODEL and state["models"] == [MODEL]
+    # the mock listens on 127.0.0.1, like an SSH tunnel to the GPU server: still server progress hints
+    assert state["remote"] is True
     assert client.post("/api/chat", json={"message": "Green tea deck"}).status_code == 202
     ui = app.state.ui
     deadline = time.time() + 20
@@ -270,3 +272,172 @@ def test_tools_are_only_sent_when_there_are_some():
     llm._http = httpx.Client(transport=httpx.MockTransport(handler))
     llm.chat([{"role": "user", "content": "count"}], [])
     assert "tools" not in seen and "tool_choice" not in seen  # vLLM rejects tool_choice without tools
+
+
+# --------------------------------------------------------------------------- fixes: .env files written by hand
+def test_env_values_as_people_write_them(tmp_path):
+    env = tmp_path / ".env"
+    env.write_bytes("\ufeff".encode() + rb'''DECK_AGENT_SERVER_URL=http://10.0.0.5:8000
+DECK_AGENT_SERVER_API_KEY="sk-123"   # from the admin
+DECK_AGENT_OUTPUT_DIR="C:\\Users\\me\\new decks"
+SINGLE='C:\Users\me\new'
+ESCAPES="say \"hi\"\tthen\nbye"
+UNTERMINATED="abc
+''')
+    values = parse_env_file(env)
+    assert values["DECK_AGENT_SERVER_URL"] == "http://10.0.0.5:8000"  # first line despite Notepad's BOM
+    assert values["DECK_AGENT_SERVER_API_KEY"] == "sk-123"  # used to keep the quotes, so the key was rejected
+    assert values["DECK_AGENT_OUTPUT_DIR"] == r"C:\Users\me\new decks"  # used to contain a newline
+    assert values["SINGLE"] == r"C:\Users\me\new"
+    assert values["ESCAPES"] == 'say "hi"\tthen\nbye'
+    assert values["UNTERMINATED"] == '"abc'
+
+
+def test_quoted_key_with_comment_is_accepted_by_the_server(tmp_path, mock_server):
+    env = tmp_path / ".env"
+    env.write_text(f'DECK_AGENT_SERVER_URL={mock_server.url}\nDECK_AGENT_SERVER_API_KEY="{KEY}"  # my key\n'
+                   f"DECK_AGENT_SERVER_MODEL={MODEL}\nDECK_AGENT_WEB=false\n")
+    assert cli.main(["run", "deck", "--mode", "server", "--env-file", str(env), "-o", str(tmp_path / "d")]) == 0
+    assert mock_server.requests[0]["headers"]["authorization"] == f"Bearer {KEY}"
+
+
+# --------------------------------------------------------------------------- fixes: startup errors are messages
+@pytest.mark.parametrize(("env", "args", "message"), [
+    ({}, ["--env-file", "missing.env"], "env file not found: missing.env"),
+    ({"DECK_AGENT_MODE": "server"}, [], "server mode is not configured"),
+    ({"DECK_AGENT_MODE": "gpu-server"}, [], "DECK_AGENT_MODE: unknown mode 'gpu-server'"),
+    ({"DECK_AGENT_NUM_CTX": "32k"}, [], "DECK_AGENT_NUM_CTX must be a whole number, got '32k'"),
+    ({"DECK_AGENT_SERVER_URL": "http://x", "DECK_AGENT_SERVER_NUM_CTX": "lots"}, [], "DECK_AGENT_SERVER_NUM_CTX"),
+])
+def test_bad_settings_exit_with_a_message(monkeypatch, env, args, message):
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    with pytest.raises(SystemExit) as exc:  # used to be a traceback
+        cli.main(["doctor", "--skip-llm-test", *args])
+    assert message in str(exc.value)
+
+
+def test_unreachable_server_without_a_model_name_exits_with_a_message(tmp_path, monkeypatch):
+    monkeypatch.setenv("DECK_AGENT_SERVER_URL", "http://127.0.0.1:9")  # nothing listens; model name left empty
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["run", "deck", "--mode", "server", "--no-web", "-o", str(tmp_path)])
+    assert "could not ask the model server which model to use" in str(exc.value)
+
+
+def test_run_header_shows_the_detected_model(tmp_path, mock_server, capsys, monkeypatch):
+    monkeypatch.setenv("COLUMNS", "250")
+    monkeypatch.setenv("DECK_AGENT_SERVER_URL", mock_server.url + "/v1/chat/completions")  # endpoint pasted as URL
+    monkeypatch.setenv("DECK_AGENT_SERVER_API_KEY", KEY)
+    assert cli.main(["run", "deck", "--mode", "server", "--no-web", "-o", str(tmp_path)]) == 0
+    header = capsys.readouterr().out.splitlines()[0]
+    assert f"model {MODEL} via openai at {mock_server.url}/v1 " in header
+
+
+def test_doctor_reports_a_server_without_models(capsys, monkeypatch):
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route
+
+    async def no_models(request):
+        return JSONResponse({"object": "list", "data": []})
+
+    monkeypatch.setenv("COLUMNS", "250")
+    monkeypatch.setenv("DECK_AGENT_WEB", "false")
+    with BackgroundServer(Starlette(routes=[Route("/v1/models", no_models)])) as srv:
+        monkeypatch.setenv("DECK_AGENT_SERVER_URL", srv.url)  # no model name configured either
+        assert cli.main(["doctor", "--mode", "server", "--skip-llm-test"]) == 1
+    assert "lists no models" in capsys.readouterr().out  # a table row; used to abort without the table
+
+
+# --------------------------------------------------------------------------- fixes: client errors and URLs
+def test_endpoint_url_pasted_as_base_url(mock_server):
+    for suffix in ("/v1/chat/completions", "/v1/models/", "/v1", ""):
+        llm = OpenAICompatLLM(MODEL, mock_server.url + suffix, api_key=KEY)
+        assert llm.list_models() == [MODEL]  # used to request .../v1/chat/completions/v1/models
+
+
+@pytest.mark.parametrize(("cls", "url", "expected", "unexpected"), [
+    (OllamaLLM, "http://localhost:9", "Start it with `ollama serve`", "SSH tunnel"),
+    (OpenAICompatLLM, "http://localhost:9", "SSH tunnel to your GPU server", "ollama serve"),  # e.g. a closed tunnel
+])
+def test_local_connect_errors_fit_the_server(cls, url, expected, unexpected):
+    with pytest.raises(LLMError) as exc:
+        cls("m", url).list_models()
+    assert expected in str(exc.value) and unexpected not in str(exc.value)
+
+
+def test_remote_connect_error_names_the_address_to_check():
+    llm = OpenAICompatLLM(MODEL, "http://gpu.example.com:8000", api_key=KEY)
+    llm._http = httpx.Client(transport=httpx.MockTransport(lambda r: (_ for _ in ()).throw(httpx.ConnectTimeout("t"))))
+    with pytest.raises(LLMError) as exc:
+        llm.list_models()
+    assert "http://gpu.example.com:8000/v1/models in a browser" in str(exc.value) and "<url>" not in str(exc.value)
+
+
+@pytest.mark.parametrize(("status", "expected"), [(500, "Server error 500: overloaded"),
+                                                  (401, "VLLM_API_KEY"), (404, "Check the server URL")])
+def test_model_list_http_errors_are_explained(status, expected):
+    llm = OpenAICompatLLM(MODEL, "http://gpu:8000", api_key=KEY)
+    llm._http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(status, text="overloaded")))
+    with pytest.raises(LLMError) as exc:
+        llm.list_models()
+    assert expected in str(exc.value) and "run out of memory" not in str(exc.value)  # not "lost the connection"
+
+
+def test_vllm_error_in_the_middle_of_a_stream_is_explained():
+    err = {"error": {"object": "error", "message": "This model's maximum context length is 32768 tokens.",
+                     "type": "BadRequestError", "code": 400}}
+    body = ('data: {"choices":[{"delta":{"content":"Hel"}}]}\n\n' + f"data: {json.dumps(err)}\n\n").encode()
+    llm = OpenAICompatLLM(MODEL, "http://gpu:8000")
+    llm._http = httpx.Client(transport=httpx.MockTransport(
+        lambda r: httpx.Response(200, content=body, headers={"content-type": "text/event-stream"})))
+    with pytest.raises(LLMError, match="DECK_AGENT_SERVER_NUM_CTX"):  # used to print a raw dict
+        llm.chat([{"role": "user", "content": "hi"}], [])
+
+
+def test_model_list_does_not_wait_for_the_answer_timeout(monkeypatch):
+    import asyncio
+
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+
+    from deck_agent import llm as llm_module
+
+    async def hang(request):
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(llm_module, "LIST_TIMEOUT", httpx.Timeout(0.5))
+    with BackgroundServer(Starlette(routes=[Route("/v1/models", hang)])) as srv:
+        t0 = time.time()
+        with pytest.raises(LLMError, match="did not list its models within"):
+            OpenAICompatLLM(MODEL, srv.url, timeout=900).list_models()
+        assert time.time() - t0 < 5
+
+
+# --------------------------------------------------------------------------- fixes: GPU server through an SSH tunnel
+def test_ssh_tunnel_counts_as_the_gpu_server(monkeypatch):
+    from deck_agent.config import is_remote_url
+
+    monkeypatch.setenv("DECK_AGENT_SERVER_URL", "http://localhost:8000")  # README: ssh -N -L 8000:localhost:8000
+    monkeypatch.setenv("DECK_AGENT_MODE", "server")
+    s = Settings.from_env()
+    assert not s.is_remote and s.uses_server  # no proxy for localhost, but server wording in hints
+    assert not is_remote_url("http://127.0.0.2:8000") and not is_remote_url("http://[::1]:8000")
+    assert is_remote_url("http://192.168.1.5:8000") and is_remote_url("https://gpu.example.com")
+
+
+def test_ui_reuses_the_model_list(tmp_path, mock_server, monkeypatch):
+    monkeypatch.setenv("DECK_AGENT_SERVER_URL", mock_server.url)
+    monkeypatch.setenv("DECK_AGENT_SERVER_API_KEY", KEY)
+    monkeypatch.setenv("DECK_AGENT_SERVER_MODEL", MODEL)
+    monkeypatch.setenv("DECK_AGENT_MODE", "server")
+    settings = Settings.from_env()
+    settings.web, settings.output_dir = False, tmp_path
+    app = create_app(settings)
+    calls = []
+    real = app.state.ui.agent.llm.list_models
+    app.state.ui.agent.llm.list_models = lambda: calls.append(1) or real()
+    client = TestClient(app, base_url="http://127.0.0.1:7860")
+    for _ in range(3):  # every page load asks for the state
+        assert client.get("/api/state").json()["models"] == [MODEL]
+    assert len(calls) == 1
