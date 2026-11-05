@@ -247,7 +247,11 @@ class DeckAgent:
                 break
             self.on_event("llm_end", {"step": step, "prompt_tokens": response.prompt_tokens,
                                       "completion_tokens": response.completion_tokens,
-                                      "recovered": response.recovered_from_text})
+                                      "recovered": response.recovered_from_text,
+                                      "seconds": response.seconds, "load_seconds": response.load_seconds,
+                                      "prompt_seconds": response.prompt_seconds,
+                                      "prompt_rate": response.prompt_rate,
+                                      "generation_rate": response.generation_rate})
 
             if not response.tool_calls:
                 text = response.content.strip()

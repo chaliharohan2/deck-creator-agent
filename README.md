@@ -29,7 +29,7 @@ deck-agent run "Create a 10-slide deck on the adoption of heat pumps in Europe f
 
 Files are written to `./decks/`: `<title>.pptx`, `.pdf`, `.html` and an editable `<title>.deck.json`.
 
-Prefer a browser? Run `deck-agent ui --open` (see [Web UI](#web-ui)).
+Prefer a browser? Run `deck-agent ui --open` (see [Web UI](#web-ui)). On a CPU the first step can take a few minutes; see [Troubleshooting](#troubleshooting).
 
 ## Web UI
 
@@ -200,6 +200,42 @@ More options, including vLLM, are in [docs/MODELS.md](docs/MODELS.md#running-wit
 * **Offline:** `--no-web`, with your own material via `--request-file`.
 
 Key-less search depends on public search engines, which **rate-limit heavy use**. When that happens the agent falls back to Wikipedia and then builds from what it has; it doesn't invent figures. See [docs/LICENSES.md](docs/LICENSES.md#what-cannot-be-done-purely-with-open-source).
+
+## Troubleshooting
+
+### It runs and runs and nothing appears
+
+On a computer without a suitable GPU this is usually **slowness, not a hang**. Two things happen before the first slide can appear:
+
+1. **Ollama loads the model into memory.** The whole model file (6.6 GB for `qwen3.5:9b`) is read from disk. With a slow or busy disk, little free RAM, or antivirus software scanning the file, this can take several minutes. It only happens on the first request: deck-agent asks Ollama to keep the model loaded for 30 minutes after each use.
+2. **The model reads the agent's instructions** (about 3,500 tokens of instructions and tool definitions). On a CPU that takes one to three minutes, and nothing is shown until it finishes. Each later step processes far less and takes roughly a minute on a CPU (seconds on a GPU).
+
+To see what is happening:
+
+* **The terminal** running `deck-agent ui` logs every step: which tool was called, how long the model took, and its prompt and writing speed. Every 30 seconds it says what a step is still waiting for: "Ollama is still loading the model…", "processing the prompt…" or "writing…".
+* **The browser** shows a timer for the current step, and an explanation if it takes long.
+* **`deck-agent doctor`** times a full-size agent request on your machine. It reports model load time, where Ollama placed the model (system RAM or GPU memory), your prompt and writing speeds, and an estimate for a 10-slide deck, with advice if that is slow.
+* **`ollama ps`** in another terminal shows whether the model is loaded and how it is split between CPU and GPU. While it is still loading, the model is not listed yet.
+
+To make it faster:
+
+* Use a smaller model: `deck-agent ui -m qwen3.5:4b` is about twice as fast as the 9B.
+* If you have an NVIDIA/AMD GPU, check that `ollama ps` says **100% GPU**. A model split between GPU and CPU runs at close to CPU speed. Lowering the context (`--num-ctx 16384`) or using a smaller model can make it fit on the GPU.
+* Close memory-hungry applications so the model is not swapped to disk.
+* Work offline from your own notes (`--no-web`, or attach files in the UI): research adds several steps.
+
+### Errors from Ollama
+
+| Message | What to do |
+|---|---|
+| "Ollama could not load … in time" (`timed out waiting for llama-server to start`) | Reading the model took longer than Ollama's 5-minute load limit. Try again (a second load is faster), free memory, or start Ollama with a longer limit: `OLLAMA_LOAD_TIMEOUT=15m ollama serve`. |
+| "Not enough free memory to load …" | Close applications, use `-m qwen3.5:4b`, or lower `--num-ctx`. |
+| "Cannot reach the ollama server" | Start Ollama (`ollama serve`, or the Ollama app) and check `deck-agent doctor`. |
+| "Model … is not installed" | `ollama pull <model>` |
+
+### PDF export or "PowerPoint render" is greyed out
+
+These need LibreOffice (free, open source); `deck-agent doctor` lists it as **optional**. Without it, PPTX and HTML still work, and you can print the HTML deck to PDF from your browser.
 
 ## What open source can't fully do
 
