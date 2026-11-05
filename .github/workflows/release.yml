@@ -12,7 +12,7 @@ on:
       - .github/workflows/ci.yml
       - scripts/ci.sh
       - pyproject.toml
-  workflow_dispatch: # manual dry run from the Actions tab
+  workflow_dispatch: # manual dry run from the Actions tab: full CI + package, everything but publishing
 
 permissions:
   contents: read
@@ -29,7 +29,9 @@ env:
 jobs:
   checks:
     name: CI
-    if: github.event_name == 'push'
+    # Tag pushes, and manual dry runs, so a dry run exercises exactly what a release does (minus
+    # publishing). Pull requests skip it: their branch was already tested by its push.
+    if: github.event_name != 'pull_request'
     uses: ./.github/workflows/ci.yml
 
   release:
@@ -60,7 +62,8 @@ jobs:
           fi
       - uses: actions/upload-artifact@v7
         with:
-          name: dist
+          # Not "dist": the CI package job in this same run uploads its own build under that name.
+          name: release-dist
           path: dist/
           if-no-files-found: error
       - name: Publish the GitHub release

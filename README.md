@@ -318,7 +318,7 @@ scripts/ci.sh test -k server_mode         # one step, with extra pytest argument
 | Workflow | Runs on | What it does |
 |---|---|---|
 | [CI](.github/workflows/ci.yml) | every push, pull requests, Mondays, manual | **Lint:** ruff and a JavaScript syntax check. **Tests:** Python 3.10–3.14. **Integration:** installs LibreOffice and Chromium, then tests PDF export and drives the web UI in a browser; a missing tool fails the job instead of skipping tests. **Package:** builds the wheel, installs it in a clean venv outside the source tree, and starts the installed web UI. |
-| [Release](.github/workflows/release.yml) | tags `v*`; dry run on PRs that change it | Runs CI, builds and smoke-tests the package, checks the tag matches `pyproject.toml`, then publishes a GitHub Release with the wheel and source archive. |
+| [Release](.github/workflows/release.yml) | tags `v*`; dry run on PRs that change it, or by hand | Runs CI, builds and smoke-tests the package, checks the tag matches `pyproject.toml`, then publishes a GitHub Release with the wheel and source archive. To rehearse a release without publishing, use **Actions → Release → Run workflow**: it runs everything a tag push does except the publish step. |
 
 To release a version, bump `version` in `pyproject.toml`, merge it to `main`, then push a matching tag:
 
