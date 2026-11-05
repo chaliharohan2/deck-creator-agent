@@ -62,7 +62,8 @@ jobs:
           fi
       - uses: actions/upload-artifact@v7
         with:
-          name: dist
+          # Not "dist": the CI package job in this same run uploads its own build under that name.
+          name: release-dist
           path: dist/
           if-no-files-found: error
       - name: Publish the GitHub release
