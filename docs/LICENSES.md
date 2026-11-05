@@ -19,6 +19,7 @@ All are OSI-approved licences; none requires an account, API key or payment.
 | Pillow | MIT-CMU | Image validation and conversion |
 | XlsxWriter | BSD-2 | Chart data embedded in .pptx (used by python-pptx) |
 | rich, markdown-it-py, mdurl, Pygments | MIT / BSD-2 | Terminal UI |
+| *Development only:* pytest, ruff, build, twine, playwright | MIT / MIT / MIT / Apache-2.0 / Apache-2.0 | Tests, lint, packaging and the browser test (`.[dev]`, `.[browser]` extras); not installed for normal use |
 | starlette, uvicorn | BSD-3 | Local web UI server (front end is hand-written HTML/CSS/JS, no external assets) |
 | pypdfium2 (PDFium) | BSD-3 / Apache-2.0 | Turns the LibreOffice PDF into slide images for the UI's "PowerPoint render" tab |
 | click, dateparser, python-dateutil, regex, pytz, tzlocal, tzdata, babel, charset-normalizer, idna, urllib3, certifi, tld, typing-extensions, annotated-types, typing-inspection | MIT / BSD / Apache-2.0 / PSF / MPL-2.0 | Transitive utilities |

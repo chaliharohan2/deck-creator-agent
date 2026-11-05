@@ -1,0 +1,11 @@
+# Keeps the workflows' actions current: GitHub retires old action runtimes (Node 20 was removed
+# from runners in 2026), which is a way for a pipeline to start failing without any code change.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]

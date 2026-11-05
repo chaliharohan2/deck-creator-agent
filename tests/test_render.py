@@ -4,7 +4,7 @@ import pytest
 from pptx import Presentation
 
 from deck_agent.deck.model import ChartSlide, Deck, ImageSlide, TableSlide
-from deck_agent.deck.render import PdfExportError, find_soffice, render_deck, safe_filename
+from deck_agent.deck.render import PdfExportError, render_deck, safe_filename
 from deck_agent.deck.svg_charts import nice_ticks, render_svg_chart
 from deck_agent.deck.text import parse_inline, short_source, sources_line
 from deck_agent.deck.themes import THEMES, get_theme
@@ -59,7 +59,7 @@ def test_missing_image_renders_placeholder(tmp_path):
     assert "missing image" in files["html"].read_text()
 
 
-@pytest.mark.skipif(find_soffice() is None, reason="LibreOffice not installed")
+@pytest.mark.pdf
 def test_pdf_export(tmp_path):
     deck = build_sample_deck("dark", tmp_path / "assets")
     files = render_deck(deck, tmp_path, "pdfdeck", ["pdf"])

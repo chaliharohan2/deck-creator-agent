@@ -221,3 +221,6 @@ __marimo__/
 
 # deck-creator-agent outputs
 decks/
+
+# CI virtualenv (scripts/ci.sh)
+.ci-venv/

@@ -9,7 +9,6 @@ from pptx import Presentation
 from starlette.testclient import TestClient
 
 from deck_agent.config import Settings
-from deck_agent.deck.render import find_soffice
 from deck_agent.factcheck import number_figure
 from deck_agent.llm import LLMResponse, ToolCall
 from deck_agent.web.server import EventLog, create_app
@@ -130,7 +129,7 @@ def test_preview_and_downloads(tmp_path):
     assert client.get("/api/download/exe").status_code == 404
 
 
-@pytest.mark.skipif(find_soffice() is None, reason="LibreOffice not installed")
+@pytest.mark.pdf
 def test_pdf_preview_is_cached_per_version(tmp_path):
     client, state, _ = make_client(tmp_path, Factory(script=BUILD_SCRIPT[:2] + ["ok"]))
     assert client.get("/api/preview.pdf").status_code == 404
@@ -348,7 +347,7 @@ def test_preview_folder_is_removed_on_shutdown(tmp_path):
     assert not preview.exists()
 
 
-@pytest.mark.skipif(find_soffice() is None, reason="LibreOffice not installed")
+@pytest.mark.pdf
 def test_old_previews_are_deleted(tmp_path):
     client, state, _ = make_client(tmp_path, Factory(script=BUILD_SCRIPT[:2] + ["ok"]))
     post(client, "/api/chat", {"message": "go"})
